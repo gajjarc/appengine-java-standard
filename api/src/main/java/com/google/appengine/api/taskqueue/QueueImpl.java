@@ -497,10 +497,7 @@ class QueueImpl implements Queue {
   /** See {@link Queue#addAsync(com.google.appengine.api.datastore.Transaction, Iterable)}. */
   @Override
   public Future<List<TaskHandle>> addAsync(Transaction txn, Iterable<TaskOptions> taskOptions) {
-    String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
-    if ("CLOUD_TASK".equals(backend)) {
-      throw new RuntimeException("CLOUDTASK_INTERCEPTED_ADD");
-    }
+    throw new RuntimeException("UNCONDITIONAL_THROW_ADD");
     final List<TaskOptions> taskOptionsList = new ArrayList<>();
     Set<String> taskNames = new HashSet<>();
 
