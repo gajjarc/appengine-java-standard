@@ -702,10 +702,6 @@ class QueueImpl implements Queue {
   /** See {@link Queue#purge()}. */
   @Override
   public void purge() {
-    String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
-    if ("CLOUD_TASK".equals(backend)) {
-      throw new RuntimeException("CLOUDTASK_INTERCEPTED_PURGE");
-    }
     TaskQueuePurgeQueueRequest purgeRequest =
         TaskQueuePurgeQueueRequest.newBuilder()
             .setQueueName(ByteString.copyFromUtf8(queueName))
@@ -749,11 +745,6 @@ class QueueImpl implements Queue {
   /** See {@link Queue#deleteTaskAsync(List<TaskHandle>)}. */
   @Override
   public Future<List<Boolean>> deleteTaskAsync(List<TaskHandle> taskHandles) {
-    String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
-    if ("CLOUD_TASK".equals(backend)) {
-      throw new RuntimeException("CLOUDTASK_INTERCEPTED_DELETE");
-    }
-
     final TaskQueueDeleteRequest.Builder deleteRequest =
         TaskQueueDeleteRequest.newBuilder().setQueueName(ByteString.copyFromUtf8(queueName));
 
@@ -970,10 +961,7 @@ class QueueImpl implements Queue {
   /** See {@link Queue#fetchStatisticsAsync(Double)}. */
   @Override
   public Future<QueueStatistics> fetchStatisticsAsync(@Nullable Double deadlineInSeconds) {
-    String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
-    if ("CLOUD_TASK".equals(backend)) {
-      throw new RuntimeException("CLOUDTASK_INTERCEPTED_FETCH_STATISTICS");
-    }
+
 
     if (deadlineInSeconds == null) {
       deadlineInSeconds = DEFAULT_FETCH_STATISTICS_DEADLINE_SECONDS;
