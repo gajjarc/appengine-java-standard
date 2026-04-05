@@ -116,6 +116,37 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                             jsonBuilder.append(",\"scheduleTime\": \"").append(isoTime).append("\"");
                         }
                         
+                        if (addRequest.hasRetryParameters()) {
+                            com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueRetryParameters retryParams = addRequest.getRetryParameters();
+                            jsonBuilder.append(",\"retryConfig\": {");
+                            boolean first = true;
+                            if (retryParams.hasRetryLimit()) {
+                                jsonBuilder.append("\"maxAttempts\": ").append(retryParams.getRetryLimit());
+                                first = false;
+                            }
+                            if (retryParams.hasAgeLimitSec()) {
+                                if (!first) jsonBuilder.append(",");
+                                jsonBuilder.append("\"maxRetryDuration\": \"").append(retryParams.getAgeLimitSec()).append("s\"");
+                                first = false;
+                            }
+                            if (retryParams.hasMinBackoffSec()) {
+                                if (!first) jsonBuilder.append(",");
+                                jsonBuilder.append("\"minBackoff\": \"").append(retryParams.getMinBackoffSec()).append("s\"");
+                                first = false;
+                            }
+                            if (retryParams.hasMaxBackoffSec()) {
+                                if (!first) jsonBuilder.append(",");
+                                jsonBuilder.append("\"maxBackoff\": \"").append(retryParams.getMaxBackoffSec()).append("s\"");
+                                first = false;
+                            }
+                            if (retryParams.hasMaxDoublings()) {
+                                if (!first) jsonBuilder.append(",");
+                                jsonBuilder.append("\"maxDoublings\": ").append(retryParams.getMaxDoublings());
+                                first = false;
+                            }
+                            jsonBuilder.append("}");
+                        }
+                        
                         jsonBuilder.append("}"); // end task
                         jsonBuilder.append("}"); // end root
                         
@@ -200,19 +231,46 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     String location = "us-east1";
                     String queueName = deleteRequest.getQueueName().toStringUtf8();
                     
-                    try (CloudTasksClient client = CloudTasksClient.create()) {
+                    com.google.appengine.api.appidentity.AppIdentityService appIdentityService = com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
+                    com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult = appIdentityService.getAccessToken(java.util.Arrays.asList("https://www.googleapis.com/auth/cloud-platform"));
+                    String token = tokenResult.getAccessToken();
+                    
+                    String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
+                    
+                    StringBuilder jsonBuilder = new StringBuilder();
+                    jsonBuilder.append("{");
+                    jsonBuilder.append("\"names\": [");
+                    for (int i = 0; i < deleteRequest.getTaskNameCount(); i++) {
+                        String taskName = deleteRequest.getTaskName(i).toStringUtf8();
+                        String fullTaskName = fullQueueName + "/tasks/" + taskName;
+                        if (i > 0) jsonBuilder.append(",");
+                        jsonBuilder.append("\"").append(fullTaskName).append("\"");
+                    }
+                    jsonBuilder.append("]");
+                    jsonBuilder.append("}");
+                    
+                    String json = jsonBuilder.toString();
+                    
+                    java.net.URL url = new java.net.URL("https://cloudtasks.googleapis.com/v2beta3/" + fullQueueName + "/tasks:batchDelete");
+                    java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+                    conn.setRequestMethod("POST");
+                    conn.setRequestProperty("Authorization", "Bearer " + token);
+                    conn.setRequestProperty("Content-Type", "application/json");
+                    conn.setDoOutput(true);
+                    
+                    try (java.io.OutputStream os = conn.getOutputStream()) {
+                        byte[] input = json.getBytes("utf-8");
+                        os.write(input, 0, input.length);
+                    }
+                    
+                    int responseCode = conn.getResponseCode();
+                    if (responseCode == 200 || responseCode == 202) { // 202 Accepted might be returned for Operations
                         for (int i = 0; i < deleteRequest.getTaskNameCount(); i++) {
-                            String taskName = deleteRequest.getTaskName(i).toStringUtf8();
-                            String fullTaskName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName + "/tasks/" + taskName;
-                            
-                            try {
-                                client.deleteTask(fullTaskName);
-                                responseBuilder.addResult(TaskQueueServiceError.ErrorCode.OK);
-                            } catch (Exception e) {
-                                System.err.println("CLOUDTASK: Failed to delete task " + taskName + ": " + e.getMessage());
-                                responseBuilder.addResult(TaskQueueServiceError.ErrorCode.UNKNOWN_TASK);
-                            }
+                            responseBuilder.addResult(TaskQueueServiceError.ErrorCode.OK);
                         }
+                    } else {
+                        System.err.println("CLOUDTASK: Batch delete failed with code " + responseCode);
+                        throw new RuntimeException("CLOUDTASK: Batch delete failed with code " + responseCode);
                     }
                     return responseBuilder.build().toByteArray();
                 } catch (Exception e) {

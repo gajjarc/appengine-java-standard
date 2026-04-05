@@ -22,5 +22,11 @@ public class InterceptorInitializer implements ServletContainerInitializer {
             registration.addMapping("/_ah/cloudtask/sweep");
             System.out.println("InterceptorInitializer: Registered SweeperServlet successfully.");
         }
+
+        javax.servlet.FilterRegistration.Dynamic filterReg = ctx.addFilter("RequestCachingFilter", RequestCachingFilter.class);
+        if (filterReg != null) {
+            filterReg.addMappingForUrlPatterns(java.util.EnumSet.of(javax.servlet.DispatcherType.REQUEST), true, "/*");
+            System.out.println("InterceptorInitializer: Registered RequestCachingFilter successfully.");
+        }
     }
 }
