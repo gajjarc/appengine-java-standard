@@ -8,6 +8,7 @@ import com.google.appengine.api.datastore.KeyFactory;
 import com.google.appengine.api.datastore.Transaction;
 import com.google.appengine.api.appidentity.AppIdentityService;
 import com.google.appengine.api.appidentity.AppIdentityServiceFactory;
+import com.google.apphosting.api.ApiProxy;
 import java.util.List;
 import java.util.Arrays;
 import java.util.Map;
@@ -75,8 +76,16 @@ public class TaskProcessor {
         }
     }
     
+    public static String getProjectId() {
+        String appId = ApiProxy.getCurrentEnvironment().getAppId();
+        if (appId != null && appId.contains("~")) {
+            return appId.substring(appId.indexOf("~") + 1);
+        }
+        return appId;
+    }
+
     private static boolean callCloudTasks(String queueName, String payload, long entityId) {
-        String projectId = "gae-direct-vpc";
+        String projectId = getProjectId();
         String location = "us-east1";
         String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
         String taskName = "task-" + entityId;

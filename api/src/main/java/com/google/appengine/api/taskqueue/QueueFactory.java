@@ -23,6 +23,23 @@ import com.google.appengine.spi.ServiceFactoryFactory;
  *
  */
 public final class QueueFactory {
+  private static final java.util.logging.Logger log = java.util.logging.Logger.getLogger(QueueFactory.class.getName());
+
+  private static void checkAndRegisterInterceptor() {
+    try {
+      com.google.apphosting.api.ApiProxy.Delegate originalDelegate = com.google.apphosting.api.ApiProxy.getDelegate();
+      if (originalDelegate != null && !(originalDelegate instanceof InterceptorDelegate)) {
+        com.google.apphosting.api.ApiProxy.setDelegate(new InterceptorDelegate(originalDelegate));
+        log.info("QueueFactory: Registered InterceptorDelegate successfully via getQueue check.");
+      } else if (originalDelegate == null) {
+        log.warning("QueueFactory: originalDelegate is null, cannot register InterceptorDelegate yet.");
+      } else {
+        log.fine("QueueFactory: InterceptorDelegate already registered.");
+      }
+    } catch (Throwable t) {
+      log.log(java.util.logging.Level.SEVERE, "QueueFactory: Failed to register InterceptorDelegate", t);
+    }
+  }
 
   /** Returns the default {@link Queue}. */
   public static Queue getDefaultQueue() {
@@ -38,6 +55,7 @@ public final class QueueFactory {
    * #getQueue(String)}.
    */
   public static Queue getQueue(String queueName) {
+    checkAndRegisterInterceptor();
     return getFactory().getQueue(queueName);
   }
 

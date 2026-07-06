@@ -63,7 +63,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     TaskQueueBulkAddRequest bulkRequest = TaskQueueBulkAddRequest.parseFrom(request);
                     TaskQueueBulkAddResponse.Builder responseBuilder = TaskQueueBulkAddResponse.newBuilder();
                     
-                    String projectId = "gae-direct-vpc";
+                    String projectId = TaskProcessor.getProjectId();
                     String location = "us-east1";
                     
                     AppIdentityService appIdentityService = AppIdentityServiceFactory.getAppIdentityService();
@@ -72,114 +72,71 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     DatastoreService ds = DatastoreServiceFactory.getDatastoreService();
                     Transaction txn = ds.getCurrentTransaction(null);
                     
+                    List<String> taskNames = new ArrayList<>();
+                    List<String> taskJsons = new ArrayList<>();
+                    List<Entity> transactionalEntities = new ArrayList<>();
+                    
+                    String queueName = "";
+                    if (bulkRequest.getAddRequestCount() > 0) {
+                        queueName = bulkRequest.getAddRequest(0).getQueueName().toStringUtf8();
+                    }
+                    String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
+
                     for (int i = 0; i < bulkRequest.getAddRequestCount(); i++) {
                         TaskQueueAddRequest addRequest = bulkRequest.getAddRequest(i);
                         if (addRequest.hasTransaction()) {
                             String tId = Long.toString(addRequest.getTransaction().getHandle());
                             System.out.println("*** CLOUDTASK: Found txnId " + tId + " in BulkAdd ***");
                         }
-                        String queueName = addRequest.getQueueName().toStringUtf8();
-                        String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
-                        
-                        String originalPayload = addRequest.getBody().toStringUtf8();
-                        String base64Body = java.util.Base64.getEncoder().encodeToString(addRequest.getBody().toByteArray());
-                        
                         String taskName = addRequest.getTaskName().toStringUtf8();
                         if (taskName == null || taskName.isEmpty() || "null".equals(taskName)) {
                             taskName = "task-" + java.util.UUID.randomUUID().toString();
                         }
+                        taskNames.add(taskName);
                         
-                        String relativeUrl = addRequest.getUrl().toStringUtf8();
-                        long etaUsec = addRequest.getEtaUsec();
-                        
-                        StringBuilder jsonBuilder = new StringBuilder();
-                        jsonBuilder.append("{");
-                        jsonBuilder.append("\"task\": {");
-                        jsonBuilder.append("\"name\": \"").append(fullQueueName).append("/tasks/").append(taskName).append("\",");
-                        jsonBuilder.append("\"appEngineHttpRequest\": {");
-                        jsonBuilder.append("\"relativeUri\": \"").append(relativeUrl).append("\",");
-                        jsonBuilder.append("\"body\": \"").append(base64Body).append("\",");
-                        jsonBuilder.append("\"headers\": {");
-                        
-                        for (int j = 0; j < addRequest.getHeaderCount(); j++) {
-                            String key = addRequest.getHeader(j).getKey().toStringUtf8();
-                            String value = addRequest.getHeader(j).getValue().toStringUtf8();
-                            if (j > 0) jsonBuilder.append(",");
-                            jsonBuilder.append("\"").append(key).append("\": \"").append(value).append("\"");
-                        }
-                        
-                        jsonBuilder.append("}"); // end headers
-                        jsonBuilder.append("}"); // end appEngineHttpRequest
-                        
-                        if (etaUsec > 0) {
-                            String isoTime = java.time.Instant.ofEpochMilli(etaUsec / 1000).toString();
-                            jsonBuilder.append(",\"scheduleTime\": \"").append(isoTime).append("\"");
-                        }
-                        
-                        if (addRequest.hasRetryParameters()) {
-                            com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueRetryParameters retryParams = addRequest.getRetryParameters();
-                            jsonBuilder.append(",\"retryConfig\": {");
-                            boolean first = true;
-                            if (retryParams.hasRetryLimit()) {
-                                jsonBuilder.append("\"maxAttempts\": ").append(retryParams.getRetryLimit());
-                                first = false;
-                            }
-                            if (retryParams.hasAgeLimitSec()) {
-                                if (!first) jsonBuilder.append(",");
-                                jsonBuilder.append("\"maxRetryDuration\": \"").append(retryParams.getAgeLimitSec()).append("s\"");
-                                first = false;
-                            }
-                            if (retryParams.hasMinBackoffSec()) {
-                                if (!first) jsonBuilder.append(",");
-                                jsonBuilder.append("\"minBackoff\": \"").append(retryParams.getMinBackoffSec()).append("s\"");
-                                first = false;
-                            }
-                            if (retryParams.hasMaxBackoffSec()) {
-                                if (!first) jsonBuilder.append(",");
-                                jsonBuilder.append("\"maxBackoff\": \"").append(retryParams.getMaxBackoffSec()).append("s\"");
-                                first = false;
-                            }
-                            if (retryParams.hasMaxDoublings()) {
-                                if (!first) jsonBuilder.append(",");
-                                jsonBuilder.append("\"maxDoublings\": ").append(retryParams.getMaxDoublings());
-                                first = false;
-                            }
-                            jsonBuilder.append("}");
-                        }
-                        
-                        jsonBuilder.append("}"); // end task
-                        jsonBuilder.append("}"); // end root
-                        
-                        String json = jsonBuilder.toString();
+                        String taskJson = buildTaskJson(addRequest, fullQueueName, taskName, environment.getModuleId());
+                        taskJsons.add(taskJson);
                         
                         if (txn != null) {
                             Entity pendingTask = new Entity("_AE_PendingCloudTask");
                             pendingTask.setProperty("queue_name", queueName);
-                            pendingTask.setProperty("cloud_task_payload", json);
+                            pendingTask.setProperty("cloud_task_payload", taskJson);
                             pendingTask.setProperty("created", new java.util.Date());
                             pendingTask.setProperty("status", "PENDING");
                             pendingTask.setProperty("sdk_lang", "JAVA");
-                            
-                            com.google.appengine.api.datastore.Key key = ds.put(txn, pendingTask);
-                            
-                            String txnId = txn.getId();
-                            Map<String, List<Long>> map = pendingTasksPerTxn;
-                            List<Long> taskIds = map.get(txnId);
-                            if (taskIds == null) {
-                                taskIds = new ArrayList<>();
-                                map.put(txnId, taskIds);
-                            }
+                            transactionalEntities.add(pendingTask);
+                        }
+                    }
+                    
+                    if (txn != null) {
+                        List<com.google.appengine.api.datastore.Key> keys = ds.put(txn, transactionalEntities);
+                        String txnId = txn.getId();
+                        List<Long> taskIds = pendingTasksPerTxn.computeIfAbsent(txnId, k -> new ArrayList<>());
+                        for (com.google.appengine.api.datastore.Key key : keys) {
                             taskIds.add(key.getId());
-                            
+                        }
+                        
+                        for (String taskName : taskNames) {
                             responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
                                 .setResult(TaskQueueServiceError.ErrorCode.OK)
                                 .setChosenTaskName(ByteString.copyFromUtf8(taskName))
                                 .build());
-                            continue;
                         }
+                    } else {
+                        StringBuilder batchJsonBuilder = new StringBuilder();
+                        batchJsonBuilder.append("{\"requests\": [");
+                        for (int i = 0; i < taskJsons.size(); i++) {
+                            if (i > 0) batchJsonBuilder.append(",");
+                            batchJsonBuilder.append("{");
+                            batchJsonBuilder.append("\"parent\": \"").append(fullQueueName).append("\",");
+                            batchJsonBuilder.append("\"task\": ").append(taskJsons.get(i));
+                            batchJsonBuilder.append("}");
+                        }
+                        batchJsonBuilder.append("]}");
+                        String batchJson = batchJsonBuilder.toString();
                         
                         try {
-                            java.net.URL url = new java.net.URL("https://cloudtasks.googleapis.com/v2beta3/" + fullQueueName + "/tasks");
+                            java.net.URL url = new java.net.URL("https://cloudtasks.googleapis.com/v2beta3/" + fullQueueName + "/tasks:batchCreate");
                             java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
                             conn.setRequestMethod("POST");
                             conn.setRequestProperty("Authorization", "Bearer " + token);
@@ -187,28 +144,54 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                             conn.setDoOutput(true);
                             
                             try (java.io.OutputStream os = conn.getOutputStream()) {
-                                byte[] input = json.getBytes("utf-8");
+                                byte[] input = batchJson.getBytes("utf-8");
                                 os.write(input, 0, input.length);
                             }
                             
                             int responseCode = conn.getResponseCode();
                             if (responseCode == 200 || responseCode == 201) {
-                                responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
-                                    .setResult(TaskQueueServiceError.ErrorCode.OK)
-                                    .setChosenTaskName(ByteString.copyFromUtf8(taskName))
-                                    .build());
+                                for (String taskName : taskNames) {
+                                    responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
+                                        .setResult(TaskQueueServiceError.ErrorCode.OK)
+                                        .setChosenTaskName(ByteString.copyFromUtf8(taskName))
+                                        .build());
+                                }
                             } else if (responseCode == 409) {
-                                System.err.println("CLOUDTASK: Task already exists: " + taskName);
-                                responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
-                                    .setResult(TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS)
-                                    .setChosenTaskName(ByteString.copyFromUtf8(taskName))
-                                    .build());
+                                System.err.println("CLOUDTASK: Batch create failed with 409 (Conflict)");
+                                for (String taskName : taskNames) {
+                                    responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
+                                        .setResult(TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS)
+                                        .setChosenTaskName(ByteString.copyFromUtf8(taskName))
+                                        .build());
+                                }
+                            } else if (responseCode == 404) {
+                                System.err.println("CLOUDTASK: Batch create failed with 404 (Not Found)");
+                                for (String taskName : taskNames) {
+                                    responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
+                                        .setResult(TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE)
+                                        .setChosenTaskName(ByteString.copyFromUtf8(taskName))
+                                        .build());
+                                }
                             } else {
-                                System.err.println("CLOUDTASK: REST API failed with code " + responseCode);
-                                throw new RuntimeException("CLOUDTASK: REST API failed with code " + responseCode);
+                                String errorDetail = "";
+                                try (java.io.InputStream es = conn.getErrorStream()) {
+                                    if (es != null) {
+                                        java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(es, "utf-8"));
+                                        StringBuilder sb = new StringBuilder();
+                                        String line;
+                                        while ((line = reader.readLine()) != null) {
+                                            sb.append(line);
+                                        }
+                                        errorDetail = sb.toString();
+                                    }
+                                } catch (Exception ex) {
+                                    errorDetail = "Failed to read error stream: " + ex.getMessage();
+                                }
+                                System.err.println("CLOUDTASK: Batch create REST API failed with code " + responseCode + ", Detail: " + errorDetail);
+                                throw new RuntimeException("CLOUDTASK: Batch create REST API failed with code " + responseCode + ", Detail: " + errorDetail);
                             }
                         } catch (Exception e) {
-                            System.err.println("CLOUDTASK: Failed to create task via REST: " + e.getMessage());
+                            System.err.println("CLOUDTASK: Failed to batch create tasks via REST: " + e.getMessage());
                             throw e;
                         }
                     }
@@ -227,7 +210,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     TaskQueueDeleteRequest deleteRequest = TaskQueueDeleteRequest.parseFrom(request);
                     TaskQueueDeleteResponse.Builder responseBuilder = TaskQueueDeleteResponse.newBuilder();
                     
-                    String projectId = "gae-direct-vpc";
+                    String projectId = TaskProcessor.getProjectId();
                     String location = "us-east1";
                     String queueName = deleteRequest.getQueueName().toStringUtf8();
                     
@@ -287,7 +270,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     TaskQueueFetchQueueStatsRequest statsRequest = TaskQueueFetchQueueStatsRequest.parseFrom(request);
                     String queueName = statsRequest.getQueueName(0).toStringUtf8();
                     
-                    String projectId = "gae-direct-vpc";
+                    String projectId = TaskProcessor.getProjectId();
                     String location = "us-east1";
                     String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
                     
@@ -379,7 +362,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     TaskQueuePurgeQueueRequest purgeRequest = TaskQueuePurgeQueueRequest.parseFrom(request);
                     String queueName = purgeRequest.getQueueName().toStringUtf8();
                     
-                    String projectId = "gae-direct-vpc";
+                    String projectId = TaskProcessor.getProjectId();
                     String location = "us-east1";
                     String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
                     
@@ -545,5 +528,69 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
     @Override
     public List<Thread> getRequestThreads(ApiProxy.Environment environment) {
         return originalDelegate.getRequestThreads(environment);
+    }
+    private static String buildTaskJson(TaskQueueAddRequest addRequest, String fullQueueName, String taskName, String serviceName) {
+        String base64Body = java.util.Base64.getEncoder().encodeToString(addRequest.getBody().toByteArray());
+        String relativeUrl = addRequest.getUrl().toStringUtf8();
+        long etaUsec = addRequest.getEtaUsec();
+        
+        StringBuilder jsonBuilder = new StringBuilder();
+        jsonBuilder.append("{");
+        jsonBuilder.append("\"name\": \"").append(fullQueueName).append("/tasks/").append(taskName).append("\",");
+        jsonBuilder.append("\"appEngineHttpRequest\": {");
+        jsonBuilder.append("\"appEngineRouting\": {");
+        jsonBuilder.append("\"service\": \"").append(serviceName).append("\"");
+        jsonBuilder.append("},");
+        jsonBuilder.append("\"relativeUri\": \"").append(relativeUrl).append("\",");
+        jsonBuilder.append("\"body\": \"").append(base64Body).append("\",");
+        jsonBuilder.append("\"headers\": {");
+        
+        for (int j = 0; j < addRequest.getHeaderCount(); j++) {
+            String key = addRequest.getHeader(j).getKey().toStringUtf8();
+            String value = addRequest.getHeader(j).getValue().toStringUtf8();
+            if (j > 0) jsonBuilder.append(",");
+            jsonBuilder.append("\"").append(key).append("\": \"").append(value).append("\"");
+        }
+        
+        jsonBuilder.append("}"); // end headers
+        jsonBuilder.append("}"); // end appEngineHttpRequest
+        
+        if (etaUsec > 0) {
+            String isoTime = java.time.Instant.ofEpochMilli(etaUsec / 1000).toString();
+            jsonBuilder.append(",\"scheduleTime\": \"").append(isoTime).append("\"");
+        }
+        
+        if (addRequest.hasRetryParameters()) {
+            com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueRetryParameters retryParams = addRequest.getRetryParameters();
+            jsonBuilder.append(",\"retryConfig\": {");
+            boolean first = true;
+            if (retryParams.hasRetryLimit()) {
+                jsonBuilder.append("\"maxAttempts\": ").append(retryParams.getRetryLimit());
+                first = false;
+            }
+            if (retryParams.hasAgeLimitSec()) {
+                if (!first) jsonBuilder.append(",");
+                jsonBuilder.append("\"maxRetryDuration\": \"").append(retryParams.getAgeLimitSec()).append("s\"");
+                first = false;
+            }
+            if (retryParams.hasMinBackoffSec()) {
+                if (!first) jsonBuilder.append(",");
+                jsonBuilder.append("\"minBackoff\": \"").append(retryParams.getMinBackoffSec()).append("s\"");
+                first = false;
+            }
+            if (retryParams.hasMaxBackoffSec()) {
+                if (!first) jsonBuilder.append(",");
+                jsonBuilder.append("\"maxBackoff\": \"").append(retryParams.getMaxBackoffSec()).append("s\"");
+                first = false;
+            }
+            if (retryParams.hasMaxDoublings()) {
+                if (!first) jsonBuilder.append(",");
+                jsonBuilder.append("\"maxDoublings\": ").append(retryParams.getMaxDoublings());
+                first = false;
+            }
+            jsonBuilder.append("}");
+        }
+        jsonBuilder.append("}");
+        return jsonBuilder.toString();
     }
 }
