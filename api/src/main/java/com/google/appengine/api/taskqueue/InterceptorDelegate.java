@@ -64,7 +64,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     TaskQueueBulkAddResponse.Builder responseBuilder = TaskQueueBulkAddResponse.newBuilder();
                     
                     String projectId = TaskProcessor.getProjectId();
-                    String location = "us-east1";
+                    String location = TaskProcessor.getLocation();
                     
                     AppIdentityService appIdentityService = AppIdentityServiceFactory.getAppIdentityService();
                     AppIdentityService.GetAccessTokenResult tokenResult = appIdentityService.getAccessToken(Arrays.asList("https://www.googleapis.com/auth/cloud-platform"));
@@ -123,76 +123,83 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                                 .build());
                         }
                     } else {
-                        StringBuilder batchJsonBuilder = new StringBuilder();
-                        batchJsonBuilder.append("{\"requests\": [");
-                        for (int i = 0; i < taskJsons.size(); i++) {
-                            if (i > 0) batchJsonBuilder.append(",");
-                            batchJsonBuilder.append("{");
-                            batchJsonBuilder.append("\"parent\": \"").append(fullQueueName).append("\",");
-                            batchJsonBuilder.append("\"task\": ").append(taskJsons.get(i));
-                            batchJsonBuilder.append("}");
-                        }
-                        batchJsonBuilder.append("]}");
-                        String batchJson = batchJsonBuilder.toString();
-                        
-                        try {
-                            java.net.URL url = new java.net.URL("https://cloudtasks.googleapis.com/v2beta3/" + fullQueueName + "/tasks:batchCreate");
-                            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
-                            conn.setRequestMethod("POST");
-                            conn.setRequestProperty("Authorization", "Bearer " + token);
-                            conn.setRequestProperty("Content-Type", "application/json");
-                            conn.setDoOutput(true);
-                            
-                            try (java.io.OutputStream os = conn.getOutputStream()) {
-                                byte[] input = batchJson.getBytes("utf-8");
-                                os.write(input, 0, input.length);
+                        int chunkSize = 100;
+                        for (int chunkStart = 0; chunkStart < taskJsons.size(); chunkStart += chunkSize) {
+                            int chunkEnd = Math.min(chunkStart + chunkSize, taskJsons.size());
+                            List<String> chunkJsons = taskJsons.subList(chunkStart, chunkEnd);
+                            List<String> chunkNames = taskNames.subList(chunkStart, chunkEnd);
+
+                            StringBuilder batchJsonBuilder = new StringBuilder();
+                            batchJsonBuilder.append("{\"requests\": [");
+                            for (int i = 0; i < chunkJsons.size(); i++) {
+                                if (i > 0) batchJsonBuilder.append(",");
+                                batchJsonBuilder.append("{");
+                                batchJsonBuilder.append("\"parent\": \"").append(fullQueueName).append("\",");
+                                batchJsonBuilder.append("\"task\": ").append(chunkJsons.get(i));
+                                batchJsonBuilder.append("}");
                             }
+                            batchJsonBuilder.append("]}");
+                            String batchJson = batchJsonBuilder.toString();
                             
-                            int responseCode = conn.getResponseCode();
-                            if (responseCode == 200 || responseCode == 201) {
-                                for (String taskName : taskNames) {
-                                    responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
-                                        .setResult(TaskQueueServiceError.ErrorCode.OK)
-                                        .setChosenTaskName(ByteString.copyFromUtf8(taskName))
-                                        .build());
+                            try {
+                                java.net.URL url = new java.net.URL("https://cloudtasks.googleapis.com/v2beta3/" + fullQueueName + "/tasks:batchCreate");
+                                java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+                                conn.setRequestMethod("POST");
+                                conn.setRequestProperty("Authorization", "Bearer " + token);
+                                conn.setRequestProperty("Content-Type", "application/json");
+                                conn.setDoOutput(true);
+                                
+                                try (java.io.OutputStream os = conn.getOutputStream()) {
+                                    byte[] input = batchJson.getBytes("utf-8");
+                                    os.write(input, 0, input.length);
                                 }
-                            } else if (responseCode == 409) {
-                                System.err.println("CLOUDTASK: Batch create failed with 409 (Conflict)");
-                                for (String taskName : taskNames) {
-                                    responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
-                                        .setResult(TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS)
-                                        .setChosenTaskName(ByteString.copyFromUtf8(taskName))
-                                        .build());
-                                }
-                            } else if (responseCode == 404) {
-                                System.err.println("CLOUDTASK: Batch create failed with 404 (Not Found)");
-                                for (String taskName : taskNames) {
-                                    responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
-                                        .setResult(TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE)
-                                        .setChosenTaskName(ByteString.copyFromUtf8(taskName))
-                                        .build());
-                                }
-                            } else {
-                                String errorDetail = "";
-                                try (java.io.InputStream es = conn.getErrorStream()) {
-                                    if (es != null) {
-                                        java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(es, "utf-8"));
-                                        StringBuilder sb = new StringBuilder();
-                                        String line;
-                                        while ((line = reader.readLine()) != null) {
-                                            sb.append(line);
-                                        }
-                                        errorDetail = sb.toString();
+                                
+                                int responseCode = conn.getResponseCode();
+                                if (responseCode == 200 || responseCode == 201) {
+                                    for (String taskName : chunkNames) {
+                                        responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
+                                            .setResult(TaskQueueServiceError.ErrorCode.OK)
+                                            .setChosenTaskName(ByteString.copyFromUtf8(taskName))
+                                            .build());
                                     }
-                                } catch (Exception ex) {
-                                    errorDetail = "Failed to read error stream: " + ex.getMessage();
+                                } else if (responseCode == 409) {
+                                    System.err.println("CLOUDTASK: Batch create failed with 409 (Conflict) for chunk");
+                                    for (String taskName : chunkNames) {
+                                        responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
+                                            .setResult(TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS)
+                                            .setChosenTaskName(ByteString.copyFromUtf8(taskName))
+                                            .build());
+                                    }
+                                } else if (responseCode == 404) {
+                                    System.err.println("CLOUDTASK: Batch create failed with 404 (Not Found) for chunk");
+                                    for (String taskName : chunkNames) {
+                                        responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
+                                            .setResult(TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE)
+                                            .setChosenTaskName(ByteString.copyFromUtf8(taskName))
+                                            .build());
+                                    }
+                                } else {
+                                    String errorDetail = "";
+                                    try (java.io.InputStream es = conn.getErrorStream()) {
+                                        if (es != null) {
+                                            java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(es, "utf-8"));
+                                            StringBuilder sb = new StringBuilder();
+                                            String line;
+                                            while ((line = reader.readLine()) != null) {
+                                                sb.append(line);
+                                            }
+                                            errorDetail = sb.toString();
+                                        }
+                                    } catch (Exception ex) {
+                                        errorDetail = "Failed to read error stream: " + ex.getMessage();
+                                    }
+                                    System.err.println("CLOUDTASK: Batch create REST API failed with code " + responseCode + ", Detail: " + errorDetail);
+                                    throw new RuntimeException("CLOUDTASK: Batch create REST API failed with code " + responseCode + ", Detail: " + errorDetail);
                                 }
-                                System.err.println("CLOUDTASK: Batch create REST API failed with code " + responseCode + ", Detail: " + errorDetail);
-                                throw new RuntimeException("CLOUDTASK: Batch create REST API failed with code " + responseCode + ", Detail: " + errorDetail);
+                            } catch (Exception e) {
+                                System.err.println("CLOUDTASK: Failed to batch create tasks via REST: " + e.getMessage());
+                                throw e;
                             }
-                        } catch (Exception e) {
-                            System.err.println("CLOUDTASK: Failed to batch create tasks via REST: " + e.getMessage());
-                            throw e;
                         }
                     }
                     return responseBuilder.build().toByteArray();
@@ -211,7 +218,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     TaskQueueDeleteResponse.Builder responseBuilder = TaskQueueDeleteResponse.newBuilder();
                     
                     String projectId = TaskProcessor.getProjectId();
-                    String location = "us-east1";
+                    String location = TaskProcessor.getLocation();
                     String queueName = deleteRequest.getQueueName().toStringUtf8();
                     
                     com.google.appengine.api.appidentity.AppIdentityService appIdentityService = com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
@@ -220,40 +227,45 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     
                     String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
                     
-                    StringBuilder jsonBuilder = new StringBuilder();
-                    jsonBuilder.append("{");
-                    jsonBuilder.append("\"names\": [");
-                    for (int i = 0; i < deleteRequest.getTaskNameCount(); i++) {
-                        String taskName = deleteRequest.getTaskName(i).toStringUtf8();
-                        String fullTaskName = fullQueueName + "/tasks/" + taskName;
-                        if (i > 0) jsonBuilder.append(",");
-                        jsonBuilder.append("\"").append(fullTaskName).append("\"");
-                    }
-                    jsonBuilder.append("]");
-                    jsonBuilder.append("}");
-                    
-                    String json = jsonBuilder.toString();
-                    
-                    java.net.URL url = new java.net.URL("https://cloudtasks.googleapis.com/v2beta3/" + fullQueueName + "/tasks:batchDelete");
-                    java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
-                    conn.setRequestMethod("POST");
-                    conn.setRequestProperty("Authorization", "Bearer " + token);
-                    conn.setRequestProperty("Content-Type", "application/json");
-                    conn.setDoOutput(true);
-                    
-                    try (java.io.OutputStream os = conn.getOutputStream()) {
-                        byte[] input = json.getBytes("utf-8");
-                        os.write(input, 0, input.length);
-                    }
-                    
-                    int responseCode = conn.getResponseCode();
-                    if (responseCode == 200 || responseCode == 202) { // 202 Accepted might be returned for Operations
-                        for (int i = 0; i < deleteRequest.getTaskNameCount(); i++) {
-                            responseBuilder.addResult(TaskQueueServiceError.ErrorCode.OK);
+                    int chunkSize = 1000;
+                    for (int chunkStart = 0; chunkStart < deleteRequest.getTaskNameCount(); chunkStart += chunkSize) {
+                        int chunkEnd = Math.min(chunkStart + chunkSize, deleteRequest.getTaskNameCount());
+                        
+                        StringBuilder jsonBuilder = new StringBuilder();
+                        jsonBuilder.append("{");
+                        jsonBuilder.append("\"names\": [");
+                        for (int i = chunkStart; i < chunkEnd; i++) {
+                            String taskName = deleteRequest.getTaskName(i).toStringUtf8();
+                            String fullTaskName = fullQueueName + "/tasks/" + taskName;
+                            if (i > chunkStart) jsonBuilder.append(",");
+                            jsonBuilder.append("\"").append(fullTaskName).append("\"");
                         }
-                    } else {
-                        System.err.println("CLOUDTASK: Batch delete failed with code " + responseCode);
-                        throw new RuntimeException("CLOUDTASK: Batch delete failed with code " + responseCode);
+                        jsonBuilder.append("]");
+                        jsonBuilder.append("}");
+                        
+                        String json = jsonBuilder.toString();
+                        
+                        java.net.URL url = new java.net.URL("https://cloudtasks.googleapis.com/v2beta3/" + fullQueueName + "/tasks:batchDelete");
+                        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+                        conn.setRequestMethod("POST");
+                        conn.setRequestProperty("Authorization", "Bearer " + token);
+                        conn.setRequestProperty("Content-Type", "application/json");
+                        conn.setDoOutput(true);
+                        
+                        try (java.io.OutputStream os = conn.getOutputStream()) {
+                            byte[] input = json.getBytes("utf-8");
+                            os.write(input, 0, input.length);
+                        }
+                        
+                        int responseCode = conn.getResponseCode();
+                        if (responseCode == 200 || responseCode == 202) { // 202 Accepted might be returned for Operations
+                            for (int i = chunkStart; i < chunkEnd; i++) {
+                                responseBuilder.addResult(TaskQueueServiceError.ErrorCode.OK);
+                            }
+                        } else {
+                            System.err.println("CLOUDTASK: Batch delete failed with code " + responseCode);
+                            throw new RuntimeException("CLOUDTASK: Batch delete failed with code " + responseCode);
+                        }
                     }
                     return responseBuilder.build().toByteArray();
                 } catch (Exception e) {
@@ -271,7 +283,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     String queueName = statsRequest.getQueueName(0).toStringUtf8();
                     
                     String projectId = TaskProcessor.getProjectId();
-                    String location = "us-east1";
+                    String location = TaskProcessor.getLocation();
                     String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
                     
                         AppIdentityService appIdentityService = AppIdentityServiceFactory.getAppIdentityService();
@@ -363,7 +375,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     String queueName = purgeRequest.getQueueName().toStringUtf8();
                     
                     String projectId = TaskProcessor.getProjectId();
-                    String location = "us-east1";
+                    String location = TaskProcessor.getLocation();
                     String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
                     
                     AppIdentityService appIdentityService = AppIdentityServiceFactory.getAppIdentityService();

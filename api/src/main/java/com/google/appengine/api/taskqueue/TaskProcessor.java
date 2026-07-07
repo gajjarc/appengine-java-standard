@@ -84,9 +84,49 @@ public class TaskProcessor {
         return appId;
     }
 
+    public static String getLocation() {
+        String location = System.getenv("GAE_LOCATION");
+        if (location != null && !location.isEmpty()) {
+            return location;
+        }
+        location = System.getenv("GAE_REGION");
+        if (location != null && !location.isEmpty()) {
+            return location;
+        }
+        location = System.getProperty("gae.location");
+        if (location != null && !location.isEmpty()) {
+            return location;
+        }
+        try {
+            java.net.URL url = new java.net.URL("http://metadata.google.internal/computeMetadata/v1/instance/zone");
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            conn.setRequestProperty("Metadata-Flavor", "Google");
+            conn.setConnectTimeout(1000);
+            conn.setReadTimeout(1000);
+            if (conn.getResponseCode() == 200) {
+                try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(conn.getInputStream(), java.nio.charset.StandardCharsets.UTF_8))) {
+                    String zone = reader.readLine();
+                    if (zone != null) {
+                        if (zone.contains("/")) {
+                            zone = zone.substring(zone.lastIndexOf('/') + 1);
+                        }
+                        int lastDash = zone.lastIndexOf('-');
+                        if (lastDash > 0) {
+                            return zone.substring(0, lastDash);
+                        }
+                        return zone;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Ignore metadata failure in local dev / testing
+        }
+        return "us-central1";
+    }
+
     private static boolean callCloudTasks(String queueName, String payload, long entityId) {
         String projectId = getProjectId();
-        String location = "us-east1";
+        String location = getLocation();
         String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
         String taskName = "task-" + entityId;
         
