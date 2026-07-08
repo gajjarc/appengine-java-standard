@@ -57,9 +57,6 @@ public class TaskProcessor {
         // Call Cloud Tasks (outside main transaction to avoid long locks)
         String queueName = (String) entity.getProperty("queue_name");
         String payload = (String) entity.getProperty("cloud_task_payload");
-        if (payload == null) {
-            payload = (String) entity.getProperty("payload");
-        }
         long entityId = key.getId();
         
         boolean success = false;
