@@ -42,12 +42,10 @@ public class TaskProcessor {
                 return;
             }
             
-            if (handledBySweeper) {
-                entity.setProperty("status", "PROCESSING");
-                entity.setProperty("lock_expires", new java.util.Date(System.currentTimeMillis() + 60000L));
-                entity.setProperty("handled_by_sweeper", true);
-                ds.put(txn, entity);
-            }
+            entity.setProperty("status", "PROCESSING");
+            entity.setProperty("lock_expires", new java.util.Date(System.currentTimeMillis() + 60000L));
+            entity.setProperty("handled_by_sweeper", handledBySweeper);
+            ds.put(txn, entity);
             txn.commit();
         } catch (Exception e) {
             if (txn.isActive()) {
