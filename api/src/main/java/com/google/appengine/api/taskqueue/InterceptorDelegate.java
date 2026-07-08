@@ -100,9 +100,14 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                         if (txn != null) {
                             Entity pendingTask = new Entity("_AE_PendingCloudTask");
                             pendingTask.setProperty("queue_name", queueName);
+                            pendingTask.setProperty("cloud_task_name", taskName);
                             pendingTask.setProperty("cloud_task_payload", taskJson);
                             pendingTask.setProperty("created", new java.util.Date());
                             pendingTask.setProperty("status", "PENDING");
+                            pendingTask.setProperty("lock_expires", null);
+                            pendingTask.setProperty("retry_count", 0L);
+                            pendingTask.setProperty("last_error", "");
+                            pendingTask.setProperty("handled_by_sweeper", false);
                             pendingTask.setProperty("sdk_lang", "JAVA");
                             transactionalEntities.add(pendingTask);
                         }

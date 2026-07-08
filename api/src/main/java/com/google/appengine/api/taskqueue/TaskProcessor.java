@@ -15,11 +15,15 @@ import java.util.Map;
 
 public class TaskProcessor {
     public static void processPendingTasks(List<Long> ids) {
+        processPendingTasks(ids, false);
+    }
+    
+    public static void processPendingTasks(List<Long> ids, boolean handledBySweeper) {
         DatastoreService ds = DatastoreServiceFactory.getDatastoreService();
         for (Long id : ids) {
             Key key = KeyFactory.createKey("_AE_PendingCloudTask", id);
             try {
-                processSingleTask(ds, key);
+                processSingleTask(ds, key, handledBySweeper);
             } catch (Exception e) {
                 System.err.println("Failed to process pending task " + id + ": " + e.getMessage());
                 e.printStackTrace();
@@ -27,7 +31,7 @@ public class TaskProcessor {
         }
     }
     
-    private static void processSingleTask(DatastoreService ds, Key key) throws Exception {
+    private static void processSingleTask(DatastoreService ds, Key key, boolean handledBySweeper) throws Exception {
         Transaction txn = ds.beginTransaction();
         Entity entity = null;
         try {
@@ -38,8 +42,12 @@ public class TaskProcessor {
                 return;
             }
             
-            entity.setProperty("status", "PROCESSING");
-            ds.put(txn, entity);
+            if (handledBySweeper) {
+                entity.setProperty("status", "PROCESSING");
+                entity.setProperty("lock_expires", new java.util.Date(System.currentTimeMillis() + 60000L));
+                entity.setProperty("handled_by_sweeper", true);
+                ds.put(txn, entity);
+            }
             txn.commit();
         } catch (Exception e) {
             if (txn.isActive()) {
@@ -51,9 +59,18 @@ public class TaskProcessor {
         // Call Cloud Tasks (outside main transaction to avoid long locks)
         String queueName = (String) entity.getProperty("queue_name");
         String payload = (String) entity.getProperty("cloud_task_payload");
+        if (payload == null) {
+            payload = (String) entity.getProperty("payload");
+        }
         long entityId = key.getId();
         
-        boolean success = callCloudTasks(queueName, payload, entityId);
+        boolean success = false;
+        try {
+            success = callCloudTasks(queueName, payload, entityId, (String) entity.getProperty("cloud_task_name"));
+        } catch (Exception ex) {
+            System.err.println("CLOUDTASK: Exception during REST dispatch for task " + entityId + ": " + ex.getMessage());
+            success = false;
+        }
         
         txn = ds.beginTransaction();
         try {
@@ -63,9 +80,19 @@ public class TaskProcessor {
                 ds.delete(txn, key); // Cleanup on success
                 System.out.println("CLOUDTASK: Successfully processed and cleaned up task " + entityId);
             } else {
-                entity.setProperty("status", "PENDING"); // Revert to pending on failure
+                Object retryObj = entity.getProperty("retry_count");
+                long retryCount = (retryObj instanceof Number) ? ((Number) retryObj).longValue() : 0L;
+                retryCount++;
+                entity.setProperty("retry_count", retryCount);
+                entity.setProperty("last_error", "Cloud Tasks REST call failed");
+                if (retryCount >= 5L) {
+                    entity.setProperty("status", "FAILED");
+                } else {
+                    entity.setProperty("status", "PENDING"); // Revert to pending on failure
+                }
+                entity.setProperty("lock_expires", null);
                 ds.put(txn, entity);
-                System.err.println("CLOUDTASK: Failed to process task " + entityId + ", reverted to PENDING");
+                System.err.println("CLOUDTASK: Failed to process task " + entityId + ", retry count: " + retryCount);
             }
             txn.commit();
         } catch (Exception e) {
@@ -124,23 +151,31 @@ public class TaskProcessor {
         return "us-central1";
     }
 
-    private static boolean callCloudTasks(String queueName, String payload, long entityId) {
+    private static boolean callCloudTasks(String queueName, String payload, long entityId, String taskName) {
         String projectId = getProjectId();
         String location = getLocation();
         String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
-        String taskName = "task-" + entityId;
+        if (taskName == null || taskName.isEmpty()) {
+            taskName = "task-" + entityId;
+        }
         
         try {
             AppIdentityService appIdentityService = AppIdentityServiceFactory.getAppIdentityService();
             AppIdentityService.GetAccessTokenResult tokenResult = appIdentityService.getAccessToken(Arrays.asList("https://www.googleapis.com/auth/cloud-platform"));
             String token = tokenResult.getAccessToken();
             
-            // The payload is already a JSON string representing the CreateTaskRequest!
-            // But we need to update the task name to use our entityId!
-            // The payload looks like: {"task": {"name": ".../tasks/task-UUID", "appEngineHttpRequest": {...}}}
-            // We need to replace the task-UUID with task-entityId!
-            
-            String updatedPayload = payload.replaceAll("\"name\": \"[^\"]+\"", "\"name\": \"" + fullQueueName + "/tasks/" + taskName + "\"");
+            String updatedPayload = payload;
+            try {
+                com.google.gson.JsonObject json = new com.google.gson.JsonParser().parse(payload).getAsJsonObject();
+                com.google.gson.JsonObject taskObj = json.getAsJsonObject("task");
+                if (taskObj != null) {
+                    taskObj.addProperty("name", fullQueueName + "/tasks/" + taskName);
+                }
+                updatedPayload = json.toString();
+            } catch (Exception ex) {
+                System.err.println("CLOUDTASK: Failed to parse payload JSON with Gson, falling back to string replacement: " + ex.getMessage());
+                updatedPayload = payload.replaceAll("\"name\": \"[^\"]+\"", "\"name\": \"" + fullQueueName + "/tasks/" + taskName + "\"");
+            }
             
             java.net.URL url = new java.net.URL("https://cloudtasks.googleapis.com/v2beta3/" + fullQueueName + "/tasks");
             java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
