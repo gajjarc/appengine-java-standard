@@ -15,6 +15,7 @@ import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueFetchQueueS
 import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueScannerQueueInfo;
 import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueuePurgeQueueRequest;
 import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueuePurgeQueueResponse;
+import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueMode;
 import com.google.cloud.tasks.v2beta3.CloudTasksClient;
 import com.google.cloud.tasks.v2beta3.GetQueueRequest;
 import com.google.cloud.tasks.v2beta3.CreateTaskRequest;
@@ -52,9 +53,49 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
         this.originalDelegate = (ApiProxy.Delegate<ApiProxy.Environment>) originalDelegate;
     }
 
+    private boolean isPullQueueRequest(String methodName, byte[] request) {
+        try {
+            if ("BulkAdd".equals(methodName)) {
+                TaskQueueBulkAddRequest bulkRequest = TaskQueueBulkAddRequest.parseFrom(request);
+                if (bulkRequest.getAddRequestCount() > 0) {
+                    TaskQueueAddRequest req0 = bulkRequest.getAddRequest(0);
+                    if (req0.getMode() == TaskQueueMode.Mode.PULL || (req0.hasQueueName() && req0.getQueueName().toStringUtf8().toLowerCase().contains("pull"))) {
+                        return true;
+                    }
+                }
+            } else if ("Delete".equals(methodName)) {
+                TaskQueueDeleteRequest deleteRequest = TaskQueueDeleteRequest.parseFrom(request);
+                if (deleteRequest.hasQueueName() && deleteRequest.getQueueName().toStringUtf8().toLowerCase().contains("pull")) {
+                    return true;
+                }
+            } else if ("FetchQueueStats".equals(methodName)) {
+                TaskQueueFetchQueueStatsRequest statsRequest = TaskQueueFetchQueueStatsRequest.parseFrom(request);
+                if (statsRequest.getQueueNameCount() > 0 && statsRequest.getQueueName(0).toStringUtf8().toLowerCase().contains("pull")) {
+                    return true;
+                }
+            } else if ("PurgeQueue".equals(methodName)) {
+                TaskQueuePurgeQueueRequest purgeRequest = TaskQueuePurgeQueueRequest.parseFrom(request);
+                if (purgeRequest.hasQueueName() && purgeRequest.getQueueName().toStringUtf8().toLowerCase().contains("pull")) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("CLOUDTASK: Error checking pull queue request: " + e.getMessage());
+        }
+        return false;
+    }
+
     @Override
     public byte[] makeSyncCall(ApiProxy.Environment environment, String packageName, String methodName, byte[] request) {
         System.out.println("*** CLOUDTASK CALL: " + packageName + "." + methodName + " ***");
+        if ("taskqueue".equals(packageName) && ("BulkAdd".equals(methodName) || "Delete".equals(methodName) || "FetchQueueStats".equals(methodName) || "PurgeQueue".equals(methodName))) {
+            String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
+            if ("CLOUD_TASK".equals(backend)) {
+                if (isPullQueueRequest(methodName, request)) {
+                    return originalDelegate.makeSyncCall(environment, packageName, methodName, request);
+                }
+            }
+        }
         if ("taskqueue".equals(packageName) && "BulkAdd".equals(methodName)) {
             String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
             if ("CLOUD_TASK".equals(backend)) {
@@ -454,6 +495,9 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
         if ("taskqueue".equals(packageName) && ("BulkAdd".equals(methodName) || "Delete".equals(methodName) || "FetchQueueStats".equals(methodName) || "PurgeQueue".equals(methodName))) {
             String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
             if ("CLOUD_TASK".equals(backend)) {
+                if (isPullQueueRequest(methodName, request)) {
+                    return originalDelegate.makeAsyncCall(environment, packageName, methodName, request, apiConfig);
+                }
                 if ("BulkAdd".equals(methodName)) {
                     try {
                         TaskQueueBulkAddRequest bulkRequest = TaskQueueBulkAddRequest.parseFrom(request);
