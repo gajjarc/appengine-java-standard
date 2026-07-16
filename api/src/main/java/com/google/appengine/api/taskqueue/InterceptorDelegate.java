@@ -304,9 +304,50 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                         }
                         
                         int responseCode = conn.getResponseCode();
-                        if (responseCode == 200 || responseCode == 202) { // 202 Accepted might be returned for Operations
-                            for (int i = chunkStart; i < chunkEnd; i++) {
-                                responseBuilder.addResult(TaskQueueServiceError.ErrorCode.OK);
+                        if (responseCode == 200 || responseCode == 202) {
+                            StringBuilder responseContent = new StringBuilder();
+                            try (java.io.BufferedReader in = new java.io.BufferedReader(new java.io.InputStreamReader(conn.getInputStream(), "utf-8"))) {
+                                String inputLine;
+                                while ((inputLine = in.readLine()) != null) {
+                                    responseContent.append(inputLine);
+                                }
+                            }
+                            String responseBody = responseContent.toString();
+                            
+                            TaskQueueServiceError.ErrorCode[] results = new TaskQueueServiceError.ErrorCode[chunkEnd - chunkStart];
+                            java.util.Arrays.fill(results, TaskQueueServiceError.ErrorCode.OK);
+                            
+                            Pattern p = Pattern.compile("\"(\\d+)\"\\s*:\\s*\\{[^{}]*?\"code\"\\s*:\\s*(\\d+)");
+                            Matcher m = p.matcher(responseBody);
+                            while (m.find()) {
+                                int idx = Integer.parseInt(m.group(1));
+                                int code = Integer.parseInt(m.group(2));
+                                if (idx >= 0 && idx < results.length) {
+                                    switch (code) {
+                                        case 5:
+                                        case 404:
+                                            results[idx] = TaskQueueServiceError.ErrorCode.UNKNOWN_TASK;
+                                            break;
+                                        case 3:
+                                        case 400:
+                                            results[idx] = TaskQueueServiceError.ErrorCode.INVALID_TASK_NAME;
+                                            break;
+                                        case 6:
+                                        case 409:
+                                            results[idx] = TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
+                                            break;
+                                        case 7:
+                                        case 403:
+                                            results[idx] = TaskQueueServiceError.ErrorCode.PERMISSION_DENIED;
+                                            break;
+                                        default:
+                                            results[idx] = TaskQueueServiceError.ErrorCode.INTERNAL_ERROR;
+                                            break;
+                                    }
+                                }
+                            }
+                            for (TaskQueueServiceError.ErrorCode res : results) {
+                                responseBuilder.addResult(res);
                             }
                         } else {
                             System.err.println("CLOUDTASK: Batch delete failed with code " + responseCode);
