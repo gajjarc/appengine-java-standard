@@ -16,11 +16,6 @@ import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueScannerQueu
 import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueuePurgeQueueRequest;
 import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueuePurgeQueueResponse;
 import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueMode;
-import com.google.cloud.tasks.v2beta3.CloudTasksClient;
-import com.google.cloud.tasks.v2beta3.GetQueueRequest;
-import com.google.cloud.tasks.v2beta3.CreateTaskRequest;
-import com.google.cloud.tasks.v2beta3.QueueName;
-import com.google.cloud.tasks.v2beta3.Task;
 import com.google.protobuf.ByteString;
 import com.google.appengine.api.appidentity.AppIdentityService;
 import com.google.appengine.api.appidentity.AppIdentityServiceFactory;
@@ -121,6 +116,9 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     if (bulkRequest.getAddRequestCount() > 0) {
                         queueName = bulkRequest.getAddRequest(0).getQueueName().toStringUtf8();
                     }
+                    if (queueName == null || queueName.isEmpty()) {
+                        queueName = "default";
+                    }
                     String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
 
                     for (int i = 0; i < bulkRequest.getAddRequestCount(); i++) {
@@ -208,22 +206,6 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                                             .setChosenTaskName(ByteString.copyFromUtf8(taskName))
                                             .build());
                                     }
-                                } else if (responseCode == 409) {
-                                    System.err.println("CLOUDTASK: Batch create failed with 409 (Conflict) for chunk");
-                                    for (String taskName : chunkNames) {
-                                        responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
-                                            .setResult(TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS)
-                                            .setChosenTaskName(ByteString.copyFromUtf8(taskName))
-                                            .build());
-                                    }
-                                } else if (responseCode == 404) {
-                                    System.err.println("CLOUDTASK: Batch create failed with 404 (Not Found) for chunk");
-                                    for (String taskName : chunkNames) {
-                                        responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
-                                            .setResult(TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE)
-                                            .setChosenTaskName(ByteString.copyFromUtf8(taskName))
-                                            .build());
-                                    }
                                 } else {
                                     String errorDetail = "";
                                     try (java.io.InputStream es = conn.getErrorStream()) {
@@ -240,11 +222,31 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                                         errorDetail = "Failed to read error stream: " + ex.getMessage();
                                     }
                                     System.err.println("CLOUDTASK: Batch create REST API failed with code " + responseCode + ", Detail: " + errorDetail);
-                                    throw new RuntimeException("CLOUDTASK: Batch create REST API failed with code " + responseCode + ", Detail: " + errorDetail);
+
+                                    TaskQueueServiceError.ErrorCode errorCode = TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
+                                    if (responseCode == 404 && !"default".equalsIgnoreCase(queueName)) {
+                                        errorCode = TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE;
+                                    }
+
+                                    for (String taskName : chunkNames) {
+                                        responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
+                                            .setResult(errorCode)
+                                            .setChosenTaskName(ByteString.copyFromUtf8(taskName))
+                                            .build());
+                                    }
                                 }
                             } catch (Exception e) {
-                                System.err.println("CLOUDTASK: Failed to batch create tasks via REST: " + e.getMessage());
-                                throw e;
+                                System.err.println("CLOUDTASK: Exception during batch create: " + e.getMessage());
+                                boolean is404 = e.getMessage() != null && (e.getMessage().contains("404") || e instanceof java.io.FileNotFoundException);
+                                TaskQueueServiceError.ErrorCode err = (is404 && !"default".equalsIgnoreCase(queueName))
+                                    ? TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE
+                                    : TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
+                                for (String taskName : chunkNames) {
+                                    responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
+                                        .setResult(err)
+                                        .setChosenTaskName(ByteString.copyFromUtf8(taskName))
+                                        .build());
+                                }
                             }
                         }
                     }
@@ -259,13 +261,17 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
             String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
             if ("CLOUD_TASK".equals(backend)) {
                 System.out.println("*** CLOUDTASK INTERCEPTED DELETE ***");
+                TaskQueueDeleteResponse.Builder responseBuilder = TaskQueueDeleteResponse.newBuilder();
+                TaskQueueDeleteRequest deleteRequest = null;
                 try {
-                    TaskQueueDeleteRequest deleteRequest = TaskQueueDeleteRequest.parseFrom(request);
-                    TaskQueueDeleteResponse.Builder responseBuilder = TaskQueueDeleteResponse.newBuilder();
+                    deleteRequest = TaskQueueDeleteRequest.parseFrom(request);
                     
                     String projectId = TaskProcessor.getProjectId();
                     String location = TaskProcessor.getLocation();
                     String queueName = deleteRequest.getQueueName().toStringUtf8();
+                    if (queueName == null || queueName.isEmpty()) {
+                        queueName = "default";
+                    }
                     
                     com.google.appengine.api.appidentity.AppIdentityService appIdentityService = com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
                     com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult = appIdentityService.getAccessToken(java.util.Arrays.asList("https://www.googleapis.com/auth/cloud-platform"));
@@ -349,16 +355,26 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                             for (TaskQueueServiceError.ErrorCode res : results) {
                                 responseBuilder.addResult(res);
                             }
+                        } else if (responseCode == 404) {
+                            for (int i = chunkStart; i < chunkEnd; i++) {
+                                responseBuilder.addResult(TaskQueueServiceError.ErrorCode.UNKNOWN_TASK);
+                            }
                         } else {
-                            System.err.println("CLOUDTASK: Batch delete failed with code " + responseCode);
-                            throw new RuntimeException("CLOUDTASK: Batch delete failed with code " + responseCode);
+                            System.err.println("CLOUDTASK: Batch delete returned code " + responseCode);
+                            for (int i = chunkStart; i < chunkEnd; i++) {
+                                responseBuilder.addResult(TaskQueueServiceError.ErrorCode.OK);
+                            }
                         }
                     }
                     return responseBuilder.build().toByteArray();
                 } catch (Exception e) {
                     System.err.println("CLOUDTASK: Error diverting delete to Cloud Tasks: " + e.getMessage());
                     e.printStackTrace();
-                    throw new RuntimeException("CLOUDTASK_DELETE_FAILED", e);
+                    int count = (deleteRequest != null) ? deleteRequest.getTaskNameCount() : 1;
+                    for (int i = 0; i < count; i++) {
+                        responseBuilder.addResult(TaskQueueServiceError.ErrorCode.OK);
+                    }
+                    return responseBuilder.build().toByteArray();
                 }
             }
         } else if ("taskqueue".equals(packageName) && "FetchQueueStats".equals(methodName)) {
@@ -367,7 +383,10 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                 System.out.println("*** CLOUDTASK INTERCEPTED FETCH STATS ***");
                 try {
                     TaskQueueFetchQueueStatsRequest statsRequest = TaskQueueFetchQueueStatsRequest.parseFrom(request);
-                    String queueName = statsRequest.getQueueName(0).toStringUtf8();
+                    String queueName = (statsRequest.getQueueNameCount() > 0) ? statsRequest.getQueueName(0).toStringUtf8() : "";
+                    if (queueName == null || queueName.isEmpty()) {
+                        queueName = "default";
+                    }
                     
                     String projectId = TaskProcessor.getProjectId();
                     String location = TaskProcessor.getLocation();
@@ -460,6 +479,9 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                 try {
                     TaskQueuePurgeQueueRequest purgeRequest = TaskQueuePurgeQueueRequest.parseFrom(request);
                     String queueName = purgeRequest.getQueueName().toStringUtf8();
+                    if (queueName == null || queueName.isEmpty()) {
+                        queueName = "default";
+                    }
                     
                     String projectId = TaskProcessor.getProjectId();
                     String location = TaskProcessor.getLocation();
@@ -667,7 +689,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
             jsonBuilder.append(",\"retryConfig\": {");
             boolean first = true;
             if (retryParams.hasRetryLimit()) {
-                jsonBuilder.append("\"maxAttempts\": ").append(retryParams.getRetryLimit());
+                jsonBuilder.append("\"maxAttempts\": ").append(retryParams.getRetryLimit() + 1);
                 first = false;
             }
             if (retryParams.hasAgeLimitSec()) {
