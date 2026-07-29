@@ -107,7 +107,11 @@ public class TaskProcessor {
     }
 
     public static String getLocation() {
-        String location = System.getenv("GAE_LOCATION");
+        String location = System.getenv("LOCATION_ID");
+        if (location != null && !location.isEmpty()) {
+            return location;
+        }
+        location = System.getenv("GAE_LOCATION");
         if (location != null && !location.isEmpty()) {
             return location;
         }
@@ -120,30 +124,27 @@ public class TaskProcessor {
             return location;
         }
         try {
-            java.net.URL url = new java.net.URL("http://metadata.google.internal/computeMetadata/v1/instance/zone");
+            java.net.URL url = new java.net.URL("http://metadata.google.internal/computeMetadata/v1/instance/region");
             java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
             conn.setRequestProperty("Metadata-Flavor", "Google");
-            conn.setConnectTimeout(1000);
-            conn.setReadTimeout(1000);
+            conn.setConnectTimeout(2000);
+            conn.setReadTimeout(2000);
             if (conn.getResponseCode() == 200) {
                 try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(conn.getInputStream(), java.nio.charset.StandardCharsets.UTF_8))) {
-                    String zone = reader.readLine();
-                    if (zone != null) {
-                        if (zone.contains("/")) {
-                            zone = zone.substring(zone.lastIndexOf('/') + 1);
+                    String regionPath = reader.readLine();
+                    if (regionPath != null) {
+                        if (regionPath.contains("/")) {
+                            return regionPath.substring(regionPath.lastIndexOf('/') + 1).trim();
                         }
-                        int lastDash = zone.lastIndexOf('-');
-                        if (lastDash > 0) {
-                            return zone.substring(0, lastDash);
-                        }
-                        return zone;
+                        return regionPath.trim();
                     }
                 }
             }
         } catch (Exception e) {
             // Ignore metadata failure in local dev / testing
         }
-        return "us-central1";
+        String localRegion = System.getenv("LOCAL_GCP_REGION");
+        return (localRegion != null && !localRegion.isEmpty()) ? localRegion : "us-central1";
     }
 
     private static boolean callCloudTasks(String queueName, String payload, long entityId, String taskName) {
