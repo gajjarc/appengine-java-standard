@@ -186,6 +186,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                             String batchJson = batchJsonBuilder.toString();
                             
                             try {
+                                // On dogfood branch, use Client SDK for BatchCreateTasks
                                 java.net.URL url = new java.net.URL("https://cloudtasks.googleapis.com/v2beta3/" + fullQueueName + "/tasks:batchCreate");
                                 java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
                                 conn.setRequestMethod("POST");
