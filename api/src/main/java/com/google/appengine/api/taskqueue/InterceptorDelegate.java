@@ -2,6 +2,8 @@ package com.google.appengine.api.taskqueue;
 
 import com.google.apphosting.api.ApiProxy;
 import com.google.cloud.tasks.v2beta3.CloudTasksClient;
+import com.google.cloud.tasks.v2beta3.BatchCreateTasksRequest;
+import com.google.cloud.tasks.v2beta3.BatchDeleteTasksRequest;
 import com.google.cloud.tasks.v2beta3.CreateTaskRequest;
 import com.google.cloud.tasks.v2beta3.Task;
 import java.util.List;
@@ -177,57 +179,37 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                             List<String> chunkNames = taskNames.subList(chunkStart, chunkEnd);
 
                             try (CloudTasksClient client = CloudTasksClient.create()) {
-                                java.lang.reflect.Method batchCreateMethod = null;
-                                for (java.lang.reflect.Method m : client.getClass().getMethods()) {
-                                    if ("batchCreateTasks".equals(m.getName()) && m.getParameterCount() == 2) {
-                                        batchCreateMethod = m;
-                                        break;
-                                    }
+                                List<CreateTaskRequest> requests = new ArrayList<>();
+                                for (int i = 0; i < chunkJsons.size(); i++) {
+                                    String taskName = chunkNames.get(i);
+                                    requests.add(CreateTaskRequest.newBuilder()
+                                        .setParent(fullQueueName)
+                                        .setTask(Task.newBuilder().setName(fullQueueName + "/tasks/" + taskName).build())
+                                        .build());
                                 }
-
-                                if (batchCreateMethod != null) {
-                                    List<CreateTaskRequest> requests = new ArrayList<>();
-                                    for (int i = 0; i < chunkJsons.size(); i++) {
-                                        String taskName = chunkNames.get(i);
-                                        requests.add(CreateTaskRequest.newBuilder()
-                                            .setParent(fullQueueName)
-                                            .setTask(Task.newBuilder().setName(fullQueueName + "/tasks/" + taskName).build())
-                                            .build());
-                                    }
-                                    batchCreateMethod.invoke(client, fullQueueName, requests);
-                                    for (String taskName : chunkNames) {
-                                        responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
-                                            .setResult(TaskQueueServiceError.ErrorCode.OK)
-                                            .setChosenTaskName(ByteString.copyFromUtf8(taskName))
-                                            .build());
-                                    }
-                                } else {
-                                    for (int i = 0; i < chunkJsons.size(); i++) {
-                                        String taskName = chunkNames.get(i);
-                                        try {
-                                            CreateTaskRequest req = CreateTaskRequest.newBuilder()
-                                                .setParent(fullQueueName)
-                                                .setTask(Task.newBuilder().setName(fullQueueName + "/tasks/" + taskName).build())
-                                                .build();
-                                            client.createTask(req);
-                                            responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
-                                                .setResult(TaskQueueServiceError.ErrorCode.OK)
-                                                .setChosenTaskName(ByteString.copyFromUtf8(taskName))
-                                                .build());
-                                        } catch (Exception ex) {
-                                            TaskQueueServiceError.ErrorCode errorCode = TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
-                                            if (ex.getMessage() != null && ex.getMessage().contains("NOT_FOUND") && !"default".equalsIgnoreCase(queueName)) {
-                                                errorCode = TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE;
-                                            }
-                                            responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
-                                                .setResult(errorCode)
-                                                .setChosenTaskName(ByteString.copyFromUtf8(taskName))
-                                                .build());
-                                        }
-                                    }
+                                BatchCreateTasksRequest batchReq = BatchCreateTasksRequest.newBuilder()
+                                    .setParent(fullQueueName)
+                                    .addAllRequests(requests)
+                                    .build();
+                                client.batchCreateTasksAsync(batchReq).get();
+                                for (String taskName : chunkNames) {
+                                    responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
+                                        .setResult(TaskQueueServiceError.ErrorCode.OK)
+                                        .setChosenTaskName(ByteString.copyFromUtf8(taskName))
+                                        .build());
                                 }
                             } catch (Exception e) {
-                                System.err.println("CLOUDTASK: Exception during task creation via Client SDK: " + e.getMessage());
+                                System.err.println("CLOUDTASK: Exception during batchCreateTasksAsync via Client SDK: " + e.getMessage());
+                                TaskQueueServiceError.ErrorCode errorCode = TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
+                                if (e.getMessage() != null && e.getMessage().contains("NOT_FOUND") && !"default".equalsIgnoreCase(queueName)) {
+                                    errorCode = TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE;
+                                }
+                                for (String taskName : chunkNames) {
+                                    responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
+                                        .setResult(errorCode)
+                                        .setChosenTaskName(ByteString.copyFromUtf8(taskName))
+                                        .build());
+                                }
                             }
                         }
                     }
@@ -264,23 +246,21 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                         int chunkSize = 1000;
                         for (int chunkStart = 0; chunkStart < deleteRequest.getTaskNameCount(); chunkStart += chunkSize) {
                             int chunkEnd = Math.min(chunkStart + chunkSize, deleteRequest.getTaskNameCount());
+                            List<String> names = new ArrayList<>();
                             for (int i = chunkStart; i < chunkEnd; i++) {
                                 String taskName = deleteRequest.getTaskName(i).toStringUtf8();
-                                String fullTaskName = fullQueueName + "/tasks/" + taskName;
-                                try {
-                                    client.deleteTask(fullTaskName);
-                                    responseBuilder.addResult(TaskQueueServiceError.ErrorCode.OK);
-                                } catch (Exception ex) {
-                                    if (ex.getMessage() != null && (ex.getMessage().contains("NOT_FOUND") || ex.getMessage().contains("404"))) {
-                                        responseBuilder.addResult(TaskQueueServiceError.ErrorCode.UNKNOWN_TASK);
-                                    } else {
-                                        responseBuilder.addResult(TaskQueueServiceError.ErrorCode.OK);
-                                    }
-                                }
+                                names.add(fullQueueName + "/tasks/" + taskName);
+                            }
+                            BatchDeleteTasksRequest batchReq = BatchDeleteTasksRequest.newBuilder()
+                                .addAllNames(names)
+                                .build();
+                            client.batchDeleteTasksAsync(batchReq).get();
+                            for (int i = chunkStart; i < chunkEnd; i++) {
+                                responseBuilder.addResult(TaskQueueServiceError.ErrorCode.OK);
                             }
                         }
                     } catch (Exception e) {
-                        System.err.println("CLOUDTASK: Exception during deleteTask via Client SDK: " + e.getMessage());
+                        System.err.println("CLOUDTASK: Exception during batchDeleteTasksAsync via Client SDK: " + e.getMessage());
                     }
                     return responseBuilder.build().toByteArray();
                 } catch (Exception e) {
