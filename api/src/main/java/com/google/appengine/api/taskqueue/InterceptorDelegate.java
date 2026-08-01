@@ -177,27 +177,53 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                             List<String> chunkNames = taskNames.subList(chunkStart, chunkEnd);
 
                             try (CloudTasksClient client = CloudTasksClient.create()) {
-                                for (int i = 0; i < chunkJsons.size(); i++) {
-                                    String taskName = chunkNames.get(i);
-                                    try {
-                                        CreateTaskRequest req = CreateTaskRequest.newBuilder()
+                                java.lang.reflect.Method batchCreateMethod = null;
+                                for (java.lang.reflect.Method m : client.getClass().getMethods()) {
+                                    if ("batchCreateTasks".equals(m.getName()) && m.getParameterCount() == 2) {
+                                        batchCreateMethod = m;
+                                        break;
+                                    }
+                                }
+
+                                if (batchCreateMethod != null) {
+                                    List<CreateTaskRequest> requests = new ArrayList<>();
+                                    for (int i = 0; i < chunkJsons.size(); i++) {
+                                        String taskName = chunkNames.get(i);
+                                        requests.add(CreateTaskRequest.newBuilder()
                                             .setParent(fullQueueName)
                                             .setTask(Task.newBuilder().setName(fullQueueName + "/tasks/" + taskName).build())
-                                            .build();
-                                        client.createTask(req);
+                                            .build());
+                                    }
+                                    batchCreateMethod.invoke(client, fullQueueName, requests);
+                                    for (String taskName : chunkNames) {
                                         responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
                                             .setResult(TaskQueueServiceError.ErrorCode.OK)
                                             .setChosenTaskName(ByteString.copyFromUtf8(taskName))
                                             .build());
-                                    } catch (Exception ex) {
-                                        TaskQueueServiceError.ErrorCode errorCode = TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
-                                        if (ex.getMessage() != null && ex.getMessage().contains("NOT_FOUND") && !"default".equalsIgnoreCase(queueName)) {
-                                            errorCode = TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE;
+                                    }
+                                } else {
+                                    for (int i = 0; i < chunkJsons.size(); i++) {
+                                        String taskName = chunkNames.get(i);
+                                        try {
+                                            CreateTaskRequest req = CreateTaskRequest.newBuilder()
+                                                .setParent(fullQueueName)
+                                                .setTask(Task.newBuilder().setName(fullQueueName + "/tasks/" + taskName).build())
+                                                .build();
+                                            client.createTask(req);
+                                            responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
+                                                .setResult(TaskQueueServiceError.ErrorCode.OK)
+                                                .setChosenTaskName(ByteString.copyFromUtf8(taskName))
+                                                .build());
+                                        } catch (Exception ex) {
+                                            TaskQueueServiceError.ErrorCode errorCode = TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
+                                            if (ex.getMessage() != null && ex.getMessage().contains("NOT_FOUND") && !"default".equalsIgnoreCase(queueName)) {
+                                                errorCode = TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE;
+                                            }
+                                            responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
+                                                .setResult(errorCode)
+                                                .setChosenTaskName(ByteString.copyFromUtf8(taskName))
+                                                .build());
                                         }
-                                        responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
-                                            .setResult(errorCode)
-                                            .setChosenTaskName(ByteString.copyFromUtf8(taskName))
-                                            .build());
                                     }
                                 }
                             } catch (Exception e) {
