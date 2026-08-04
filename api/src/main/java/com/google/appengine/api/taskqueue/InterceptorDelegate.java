@@ -1,14 +1,6 @@
 package com.google.appengine.api.taskqueue;
 
 import com.google.apphosting.api.ApiProxy;
-import com.google.cloud.tasks.v2beta3.CloudTasksClient;
-import com.google.cloud.tasks.v2beta3.BatchCreateTasksRequest;
-import com.google.cloud.tasks.v2beta3.BatchDeleteTasksRequest;
-import com.google.cloud.tasks.v2beta3.CreateTaskRequest;
-import com.google.cloud.tasks.v2beta3.Task;
-import com.google.cloud.tasks.v2beta3.AppEngineHttpRequest;
-import com.google.cloud.tasks.v2beta3.AppEngineRouting;
-import com.google.cloud.tasks.v2beta3.HttpMethod;
 import java.util.List;
 import java.util.concurrent.Future;
 import java.util.concurrent.CompletableFuture;
@@ -174,63 +166,26 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     } else {
                         String serviceName = environment.getModuleId();
                         int chunkSize = 100;
-                        for (int chunkStart = 0; chunkStart < bulkRequest.getAddRequestCount(); chunkStart += chunkSize) {
-                            int chunkEnd = Math.min(chunkStart + chunkSize, bulkRequest.getAddRequestCount());
-                            try (CloudTasksClient client = CloudTasksClient.create()) {
-                                List<CreateTaskRequest> requests = new ArrayList<>();
-                                List<String> chunkNames = new ArrayList<>();
-                                for (int i = chunkStart; i < chunkEnd; i++) {
-                                    TaskQueueAddRequest addRequest = bulkRequest.getAddRequest(i);
-                                    String taskName = taskNames.get(i);
-                                    chunkNames.add(taskName);
-                                    
-                                    AppEngineHttpRequest.Builder httpReqBuilder = AppEngineHttpRequest.newBuilder()
-                                        .setRelativeUri(addRequest.getUrl().toStringUtf8())
-                                        .setHttpMethod(HttpMethod.POST)
-                                        .setBody(addRequest.getBody());
-                                    if (serviceName != null && !serviceName.isEmpty()) {
-                                        httpReqBuilder.setAppEngineRouting(AppEngineRouting.newBuilder().setService(serviceName).build());
-                                    }
-                                    for (int j = 0; j < addRequest.getHeaderCount(); j++) {
-                                        httpReqBuilder.putHeaders(addRequest.getHeader(j).getKey().toStringUtf8(), addRequest.getHeader(j).getValue().toStringUtf8());
-                                    }
-                                    com.google.cloud.tasks.v2beta3.Task.Builder taskBuilder = com.google.cloud.tasks.v2beta3.Task.newBuilder()
-                                        .setName(fullQueueName + "/tasks/" + taskName)
-                                        .setAppEngineHttpRequest(httpReqBuilder.build());
-                                    if (addRequest.getEtaUsec() > 0) {
-                                        taskBuilder.setScheduleTime(com.google.protobuf.Timestamp.newBuilder()
-                                            .setSeconds(addRequest.getEtaUsec() / 1000000L)
-                                            .setNanos((int) ((addRequest.getEtaUsec() % 1000000L) * 1000))
-                                            .build());
-                                    }
-                                    requests.add(CreateTaskRequest.newBuilder()
-                                        .setParent(fullQueueName)
-                                        .setTask(taskBuilder.build())
-                                        .build());
+                        for (int chunkStart = 0; chunkStart < taskJsons.size(); chunkStart += chunkSize) {
+                            int chunkEnd = Math.min(chunkStart + chunkSize, taskJsons.size());
+                            List<String> chunkJsons = taskJsons.subList(chunkStart, chunkEnd);
+                            List<String> chunkNames = taskNames.subList(chunkStart, chunkEnd);
+
+                            boolean allSuccess = true;
+                            for (int i = 0; i < chunkJsons.size(); i++) {
+                                String taskName = chunkNames.get(i);
+                                String taskJson = chunkJsons.get(i);
+                                boolean ok = TaskProcessor.callCloudTasks(queueName, taskJson, 0L, taskName);
+                                if (!ok) {
+                                    allSuccess = false;
                                 }
-                                BatchCreateTasksRequest batchReq = BatchCreateTasksRequest.newBuilder()
-                                    .setParent(fullQueueName)
-                                    .addAllRequests(requests)
-                                    .build();
-                                client.batchCreateTasksAsync(batchReq).get();
-                                for (String taskName : chunkNames) {
-                                    responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
-                                        .setResult(TaskQueueServiceError.ErrorCode.OK)
-                                        .setChosenTaskName(ByteString.copyFromUtf8(taskName))
-                                        .build());
-                                }
-                            } catch (Exception e) {
-                                logger.log(Level.SEVERE, "CLOUDTASK: Exception during batchCreateTasksAsync via Client SDK: " + e.getMessage(), e);
-                                TaskQueueServiceError.ErrorCode errorCode = TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
-                                if (e.getMessage() != null && e.getMessage().contains("NOT_FOUND") && !"default".equalsIgnoreCase(queueName)) {
-                                    errorCode = TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE;
-                                }
-                                int count = chunkEnd - chunkStart;
-                                for (int i = 0; i < count; i++) {
-                                    responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
-                                        .setResult(errorCode)
-                                        .build());
-                                }
+                            }
+                            TaskQueueServiceError.ErrorCode errorCode = allSuccess ? TaskQueueServiceError.ErrorCode.OK : TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
+                            for (String taskName : chunkNames) {
+                                responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
+                                    .setResult(errorCode)
+                                    .setChosenTaskName(ByteString.copyFromUtf8(taskName))
+                                    .build());
                             }
                         }
                     }
@@ -258,25 +213,10 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     
                     String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
                     
-                    try (CloudTasksClient client = CloudTasksClient.create()) {
-                        int chunkSize = 1000;
-                        for (int chunkStart = 0; chunkStart < deleteRequest.getTaskNameCount(); chunkStart += chunkSize) {
-                            int chunkEnd = Math.min(chunkStart + chunkSize, deleteRequest.getTaskNameCount());
-                            List<String> names = new ArrayList<>();
-                            for (int i = chunkStart; i < chunkEnd; i++) {
-                                String taskName = deleteRequest.getTaskName(i).toStringUtf8();
-                                names.add(fullQueueName + "/tasks/" + taskName);
-                            }
-                            BatchDeleteTasksRequest batchReq = BatchDeleteTasksRequest.newBuilder()
-                                .addAllNames(names)
-                                .build();
-                            client.batchDeleteTasksAsync(batchReq).get();
-                            for (int i = chunkStart; i < chunkEnd; i++) {
-                                responseBuilder.addResult(TaskQueueServiceError.ErrorCode.OK);
-                            }
-                        }
-                    } catch (Exception e) {
-                        logger.log(Level.SEVERE, "CLOUDTASK: Exception during batchDeleteTasksAsync via Client SDK: " + e.getMessage(), e);
+                    for (int i = 0; i < deleteRequest.getTaskNameCount(); i++) {
+                        String taskName = deleteRequest.getTaskName(i).toStringUtf8();
+                        TaskProcessor.deleteCloudTask(fullQueueName + "/tasks/" + taskName);
+                        responseBuilder.addResult(TaskQueueServiceError.ErrorCode.OK);
                     }
                     return responseBuilder.build().toByteArray();
                 } catch (Exception e) {
