@@ -532,6 +532,9 @@ class QueueImpl implements Queue {
       throw new IllegalArgumentException(
           "May not add both push tasks and pull tasks in the same call.");
     }
+    if (hasPushTask && CloudTasksClientWrapper.isEnabled()) {
+      return CloudTasksClientWrapper.addAsync(queueName, txn, taskOptionsList);
+    }
     TaskQueueBulkAddRequest builtRequest = bulkAddRequest.build();
     if (txn != null
         && builtRequest.getSerializedSize() > QueueConstants.maxTransactionalRequestSizeBytes()) {
@@ -703,6 +706,10 @@ class QueueImpl implements Queue {
   /** See {@link Queue#purge()}. */
   @Override
   public void purge() {
+    if (CloudTasksClientWrapper.isEnabled()) {
+      CloudTasksClientWrapper.purge(queueName);
+      return;
+    }
     TaskQueuePurgeQueueRequest purgeRequest =
         TaskQueuePurgeQueueRequest.newBuilder()
             .setQueueName(ByteString.copyFromUtf8(queueName))
@@ -746,6 +753,9 @@ class QueueImpl implements Queue {
   /** See {@link Queue#deleteTaskAsync(List<TaskHandle>)}. */
   @Override
   public Future<List<Boolean>> deleteTaskAsync(List<TaskHandle> taskHandles) {
+    if (CloudTasksClientWrapper.isEnabled()) {
+      return CloudTasksClientWrapper.deleteTaskAsync(queueName, taskHandles);
+    }
     final TaskQueueDeleteRequest.Builder deleteRequest =
         TaskQueueDeleteRequest.newBuilder().setQueueName(ByteString.copyFromUtf8(queueName));
 
@@ -962,8 +972,9 @@ class QueueImpl implements Queue {
   /** See {@link Queue#fetchStatisticsAsync(Double)}. */
   @Override
   public Future<QueueStatistics> fetchStatisticsAsync(@Nullable Double deadlineInSeconds) {
-
-
+    if (CloudTasksClientWrapper.isEnabled()) {
+      return CloudTasksClientWrapper.fetchStatisticsAsync(queueName);
+    }
     if (deadlineInSeconds == null) {
       deadlineInSeconds = DEFAULT_FETCH_STATISTICS_DEADLINE_SECONDS;
     }
