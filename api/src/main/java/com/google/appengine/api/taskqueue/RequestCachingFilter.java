@@ -4,6 +4,7 @@ import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.util.logging.Logger;
 import javax.servlet.Filter;
 import javax.servlet.FilterChain;
 import javax.servlet.FilterConfig;
@@ -16,10 +17,11 @@ import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletRequestWrapper;
 
 public class RequestCachingFilter implements Filter {
+    private static final Logger logger = Logger.getLogger(RequestCachingFilter.class.getName());
 
     @Override
     public void init(FilterConfig filterConfig) throws ServletException {
-        System.out.println("RequestCachingFilter: Initialized");
+        logger.info("RequestCachingFilter: Initialized");
     }
 
     @Override
@@ -33,7 +35,7 @@ public class RequestCachingFilter implements Filter {
                 String uri = httpRequest.getRequestURI();
                 // Only cache for task handler or sweep endpoints to avoid overhead on other requests
                 if (uri.contains("/task-handler") || uri.contains("/_ah/cloudtask/sweep")) {
-                    System.out.println("RequestCachingFilter: Caching request for URI: " + uri);
+                    logger.info("RequestCachingFilter: Caching request for URI: " + uri);
                     CachedRequestWrapper wrappedRequest = new CachedRequestWrapper(httpRequest);
                     chain.doFilter(wrappedRequest, response);
                     return;

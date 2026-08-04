@@ -9,12 +9,15 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.logging.Logger;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
 public class SweeperServlet extends HttpServlet {
+    private static final Logger logger = Logger.getLogger(SweeperServlet.class.getName());
+
     @Override
     protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
         String cronHeader = req.getHeader("X-AppEngine-Cron");
@@ -27,7 +30,7 @@ public class SweeperServlet extends HttpServlet {
             return;
         }
 
-        System.out.println("*** CLOUDTASK: Sweeper Cron Triggered ***");
+        logger.info("*** CLOUDTASK: Sweeper Cron Triggered ***");
         DatastoreService ds = DatastoreServiceFactory.getDatastoreService();
         Query q = new Query("_AE_PendingCloudTask");
         PreparedQuery pq = ds.prepare(q);
@@ -61,7 +64,7 @@ public class SweeperServlet extends HttpServlet {
         }
 
         if (!idsToProcess.isEmpty()) {
-            System.out.println("CLOUDTASK: Sweeper found " + idsToProcess.size() + " tasks to process.");
+            logger.info("CLOUDTASK: Sweeper found " + idsToProcess.size() + " tasks to process.");
             TaskProcessor.processPendingTasks(idsToProcess, true);
         }
 

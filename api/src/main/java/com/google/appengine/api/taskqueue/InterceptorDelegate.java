@@ -36,15 +36,12 @@ import com.google.appengine.api.datastore.Transaction;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.ArrayList;
-import com.google.appengine.api.datastore.DatastoreService;
-import com.google.appengine.api.datastore.DatastoreServiceFactory;
-import com.google.appengine.api.datastore.Transaction;
 import com.google.appengine.api.datastore.Entity;
-import java.util.Map;
-import java.util.HashMap;
-import java.util.ArrayList;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environment> {
+    private static final Logger logger = Logger.getLogger(InterceptorDelegate.class.getName());
     private static final Map<String, List<Long>> pendingTasksPerTxn = new java.util.concurrent.ConcurrentHashMap<>();
     private final ApiProxy.Delegate<ApiProxy.Environment> originalDelegate;
 
@@ -80,14 +77,14 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                 }
             }
         } catch (Exception e) {
-            System.err.println("CLOUDTASK: Error checking pull queue request: " + e.getMessage());
+            logger.log(Level.WARNING, "CLOUDTASK: Error checking pull queue request", e);
         }
         return false;
     }
 
     @Override
     public byte[] makeSyncCall(ApiProxy.Environment environment, String packageName, String methodName, byte[] request) {
-        System.out.println("*** CLOUDTASK CALL: " + packageName + "." + methodName + " ***");
+        logger.fine("*** CLOUDTASK CALL: " + packageName + "." + methodName + " ***");
         if ("taskqueue".equals(packageName) && ("BulkAdd".equals(methodName) || "Delete".equals(methodName) || "FetchQueueStats".equals(methodName) || "PurgeQueue".equals(methodName))) {
             String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
             if ("CLOUD_TASK".equals(backend)) {
@@ -99,7 +96,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
         if ("taskqueue".equals(packageName) && "BulkAdd".equals(methodName)) {
             String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
             if ("CLOUD_TASK".equals(backend)) {
-                System.out.println("*** CLOUDTASK INTERCEPTED ***");
+                logger.info("*** CLOUDTASK INTERCEPTED ***");
                 try {
                     TaskQueueBulkAddRequest bulkRequest = TaskQueueBulkAddRequest.parseFrom(request);
                     TaskQueueBulkAddResponse.Builder responseBuilder = TaskQueueBulkAddResponse.newBuilder();
@@ -130,7 +127,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                         TaskQueueAddRequest addRequest = bulkRequest.getAddRequest(i);
                         if (addRequest.hasTransaction()) {
                             String tId = Long.toString(addRequest.getTransaction().getHandle());
-                            System.out.println("*** CLOUDTASK: Found txnId " + tId + " in BulkAdd ***");
+                            logger.info("*** CLOUDTASK: Found txnId " + tId + " in BulkAdd ***");
                         }
                         String taskName = addRequest.getTaskName().toStringUtf8();
                         if (taskName == null || taskName.isEmpty() || "null".equals(taskName)) {
@@ -199,7 +196,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                                         .build());
                                 }
                             } catch (Exception e) {
-                                System.err.println("CLOUDTASK: Exception during batchCreateTasksAsync via Client SDK: " + e.getMessage());
+                                logger.log(Level.SEVERE, "CLOUDTASK: Exception during batchCreateTasksAsync via Client SDK: " + e.getMessage(), e);
                                 TaskQueueServiceError.ErrorCode errorCode = TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
                                 if (e.getMessage() != null && e.getMessage().contains("NOT_FOUND") && !"default".equalsIgnoreCase(queueName)) {
                                     errorCode = TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE;
@@ -215,15 +212,14 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                     }
                     return responseBuilder.build().toByteArray();
                 } catch (Exception e) {
-                    System.err.println("CLOUDTASK: Error diverting to Cloud Tasks: " + e.getMessage());
-                    e.printStackTrace();
+                    logger.log(Level.SEVERE, "CLOUDTASK: Error diverting to Cloud Tasks: " + e.getMessage(), e);
                     throw new RuntimeException("CLOUDTASK_DIVERSION_FAILED", e);
                 }
             }
         } else if ("taskqueue".equals(packageName) && "Delete".equals(methodName)) {
             String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
             if ("CLOUD_TASK".equals(backend)) {
-                System.out.println("*** CLOUDTASK INTERCEPTED DELETE ***");
+                logger.info("*** CLOUDTASK INTERCEPTED DELETE ***");
                 TaskQueueDeleteResponse.Builder responseBuilder = TaskQueueDeleteResponse.newBuilder();
                 TaskQueueDeleteRequest deleteRequest = null;
                 try {
@@ -260,12 +256,11 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                             }
                         }
                     } catch (Exception e) {
-                        System.err.println("CLOUDTASK: Exception during batchDeleteTasksAsync via Client SDK: " + e.getMessage());
+                        logger.log(Level.SEVERE, "CLOUDTASK: Exception during batchDeleteTasksAsync via Client SDK: " + e.getMessage(), e);
                     }
                     return responseBuilder.build().toByteArray();
                 } catch (Exception e) {
-                    System.err.println("CLOUDTASK: Error diverting delete to Cloud Tasks: " + e.getMessage());
-                    e.printStackTrace();
+                    logger.log(Level.SEVERE, "CLOUDTASK: Error diverting delete to Cloud Tasks: " + e.getMessage(), e);
                     int count = (deleteRequest != null) ? deleteRequest.getTaskNameCount() : 1;
                     for (int i = 0; i < count; i++) {
                         responseBuilder.addResult(TaskQueueServiceError.ErrorCode.OK);
@@ -276,7 +271,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
         } else if ("taskqueue".equals(packageName) && "FetchQueueStats".equals(methodName)) {
             String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
             if ("CLOUD_TASK".equals(backend)) {
-                System.out.println("*** CLOUDTASK INTERCEPTED FETCH STATS ***");
+                logger.info("*** CLOUDTASK INTERCEPTED FETCH STATS ***");
                 try {
                     TaskQueueFetchQueueStatsRequest statsRequest = TaskQueueFetchQueueStatsRequest.parseFrom(request);
                     String queueName = (statsRequest.getQueueNameCount() > 0) ? statsRequest.getQueueName(0).toStringUtf8() : "";
@@ -363,15 +358,14 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                             throw new RuntimeException("CLOUDTASK: REST API failed with code " + responseCode);
                         }
                 } catch (Exception e) {
-                    System.err.println("CLOUDTASK: Failed to fetch stats: " + e.getMessage());
-                    e.printStackTrace();
+                    logger.log(Level.SEVERE, "CLOUDTASK: Failed to fetch stats: " + e.getMessage(), e);
                     throw new RuntimeException("CLOUDTASK_STATS_FAILED", e);
                 }
             }
         } else if ("taskqueue".equals(packageName) && "PurgeQueue".equals(methodName)) {
             String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
             if ("CLOUD_TASK".equals(backend)) {
-                System.out.println("*** CLOUDTASK INTERCEPTED PURGE ***");
+                logger.info("*** CLOUDTASK INTERCEPTED PURGE ***");
                 try {
                     TaskQueuePurgeQueueRequest purgeRequest = TaskQueuePurgeQueueRequest.parseFrom(request);
                     String queueName = purgeRequest.getQueueName().toStringUtf8();
@@ -404,11 +398,11 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                         TaskQueuePurgeQueueResponse.Builder responseBuilder = TaskQueuePurgeQueueResponse.newBuilder();
                         return responseBuilder.build().toByteArray();
                     } else {
-                        System.err.println("CLOUDTASK: Purge failed with code " + responseCode);
+                        logger.severe("CLOUDTASK: Purge failed with code " + responseCode);
                         throw new RuntimeException("CLOUDTASK: Purge failed with code " + responseCode);
                     }
                 } catch (Exception e) {
-                    System.err.println("CLOUDTASK: Failed to purge queue: " + e.getMessage());
+                    logger.log(Level.SEVERE, "CLOUDTASK: Failed to purge queue: " + e.getMessage(), e);
                     throw new RuntimeException("CLOUDTASK_PURGE_FAILED", e);
                 }
             }
@@ -427,13 +421,13 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                 Map<String, List<Long>> map = pendingTasksPerTxn;
                 List<Long> taskIds = map.get(txnId);
                 if (taskIds != null && !taskIds.isEmpty()) {
-                    System.out.println("*** CLOUDTASK: Triggering Fast Path for txn " + txnId + " ***");
+                    logger.info("*** CLOUDTASK: Triggering Fast Path for txn " + txnId + " ***");
                     final List<Long> idsToProcess = new java.util.ArrayList<>(taskIds);
                     ApiProxy.Environment env = ApiProxy.getCurrentEnvironment();
                     CompletableFuture.runAsync(() -> {
                         ApiProxy.setEnvironmentForCurrentThread(env);
                         try {
-                            System.out.println("*** CLOUDTASK: Fast Path processing for tasks: " + idsToProcess + " ***");
+                            logger.info("*** CLOUDTASK: Fast Path processing for tasks: " + idsToProcess + " ***");
                             TaskProcessor.processPendingTasks(idsToProcess);
                         } finally {
                             ApiProxy.setEnvironmentForCurrentThread(null);
@@ -450,7 +444,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
 
     @Override
     public Future<byte[]> makeAsyncCall(ApiProxy.Environment environment, String packageName, String methodName, byte[] request, ApiProxy.ApiConfig apiConfig) {
-        System.out.println("*** CLOUDTASK ASYNC CALL: " + packageName + "." + methodName + " ***");
+        logger.fine("*** CLOUDTASK ASYNC CALL: " + packageName + "." + methodName + " ***");
         if ("taskqueue".equals(packageName) && ("BulkAdd".equals(methodName) || "Delete".equals(methodName) || "FetchQueueStats".equals(methodName) || "PurgeQueue".equals(methodName))) {
             String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
             if ("CLOUD_TASK".equals(backend)) {
@@ -468,11 +462,11 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                             }
                         }
                         if (isTransactional) {
-                            System.out.println("*** CLOUDTASK: Running BulkAdd synchronously for transactional task ***");
+                            logger.info("*** CLOUDTASK: Running BulkAdd synchronously for transactional task ***");
                             return java.util.concurrent.CompletableFuture.completedFuture(makeSyncCall(environment, packageName, methodName, request));
                         }
                     } catch (Exception e) {
-                        System.out.println("*** CLOUDTASK: Failed to parse BulkAdd in makeAsyncCall: " + e.getMessage() + " ***");
+                        logger.warning("*** CLOUDTASK: Failed to parse BulkAdd in makeAsyncCall: " + e.getMessage() + " ***");
                     }
                 }
                 
@@ -492,9 +486,9 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
             try {
                 com.google.apphosting.datastore_bytes.proto2api.DatastoreV3Pb.Transaction txnProto = com.google.apphosting.datastore_bytes.proto2api.DatastoreV3Pb.Transaction.parseFrom(request);
                 txnId = Long.toString(txnProto.getHandle());
-                System.out.println("*** CLOUDTASK: Found txnId " + txnId + " in Commit ***");
+                logger.info("*** CLOUDTASK: Found txnId " + txnId + " in Commit ***");
             } catch (Exception e) {
-                System.out.println("*** CLOUDTASK: Failed to parse Commit request: " + e.getMessage() + " ***");
+                logger.warning("*** CLOUDTASK: Failed to parse Commit request: " + e.getMessage() + " ***");
             }
             
             Future<byte[]> future = originalDelegate.makeAsyncCall(environment, packageName, methodName, request, apiConfig);
@@ -507,13 +501,13 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                         Map<String, List<Long>> map = pendingTasksPerTxn;
                         List<Long> taskIds = map.get(finalTxnId);
                         if (taskIds != null && !taskIds.isEmpty()) {
-                            System.out.println("*** CLOUDTASK: Triggering Fast Path for txn " + finalTxnId + " ***");
+                            logger.info("*** CLOUDTASK: Triggering Fast Path for txn " + finalTxnId + " ***");
                             final List<Long> idsToProcess = new java.util.ArrayList<>(taskIds);
                             ApiProxy.Environment env = ApiProxy.getCurrentEnvironment();
                             CompletableFuture.runAsync(() -> {
                                 ApiProxy.setEnvironmentForCurrentThread(env);
                                 try {
-                                    System.out.println("*** CLOUDTASK: Fast Path processing for tasks: " + idsToProcess + " ***");
+                                    logger.info("*** CLOUDTASK: Fast Path processing for tasks: " + idsToProcess + " ***");
                                     TaskProcessor.processPendingTasks(idsToProcess);
                                 } finally {
                                     ApiProxy.setEnvironmentForCurrentThread(null);

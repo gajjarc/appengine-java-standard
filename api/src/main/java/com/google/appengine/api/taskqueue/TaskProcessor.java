@@ -12,8 +12,12 @@ import com.google.apphosting.api.ApiProxy;
 import java.util.List;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 public class TaskProcessor {
+    private static final Logger logger = Logger.getLogger(TaskProcessor.class.getName());
+
     public static void processPendingTasks(List<Long> ids) {
         processPendingTasks(ids, false);
     }
@@ -25,8 +29,7 @@ public class TaskProcessor {
             try {
                 processSingleTask(ds, key, handledBySweeper);
             } catch (Exception e) {
-                System.err.println("Failed to process pending task " + id + ": " + e.getMessage());
-                e.printStackTrace();
+                logger.log(Level.SEVERE, "Failed to process pending task " + id + ": " + e.getMessage(), e);
             }
         }
     }
@@ -63,7 +66,7 @@ public class TaskProcessor {
         try {
             success = callCloudTasks(queueName, payload, entityId, (String) entity.getProperty("cloud_task_name"));
         } catch (Exception ex) {
-            System.err.println("CLOUDTASK: Exception during REST dispatch for task " + entityId + ": " + ex.getMessage());
+            logger.log(Level.SEVERE, "CLOUDTASK: Exception during REST dispatch for task " + entityId + ": " + ex.getMessage(), ex);
             success = false;
         }
         
@@ -73,7 +76,7 @@ public class TaskProcessor {
             if (success) {
                 entity.setProperty("status", "DONE");
                 ds.delete(txn, key); // Cleanup on success
-                System.out.println("CLOUDTASK: Successfully processed and cleaned up task " + entityId);
+                logger.info("CLOUDTASK: Successfully processed and cleaned up task " + entityId);
             } else {
                 Object retryObj = entity.getProperty("retry_count");
                 long retryCount = (retryObj instanceof Number) ? ((Number) retryObj).longValue() : 0L;
@@ -87,7 +90,7 @@ public class TaskProcessor {
                 }
                 entity.setProperty("lock_expires", null);
                 ds.put(txn, entity);
-                System.err.println("CLOUDTASK: Failed to process task " + entityId + ", retry count: " + retryCount);
+                logger.warning("CLOUDTASK: Failed to process task " + entityId + ", retry count: " + retryCount);
             }
             txn.commit();
         } catch (Exception e) {
@@ -169,7 +172,7 @@ public class TaskProcessor {
                 }
                 updatedPayload = json.toString();
             } catch (Exception ex) {
-                System.err.println("CLOUDTASK: Failed to parse payload JSON with Gson, falling back to string replacement: " + ex.getMessage());
+                logger.warning("CLOUDTASK: Failed to parse payload JSON with Gson, falling back to string replacement: " + ex.getMessage());
                 updatedPayload = payload.replaceAll("\"name\": \"[^\"]+\"", "\"name\": \"" + fullQueueName + "/tasks/" + taskName + "\"");
             }
             
@@ -189,15 +192,14 @@ public class TaskProcessor {
             if (responseCode == 200 || responseCode == 201) {
                 return true;
             } else if (responseCode == 409) {
-                System.out.println("CLOUDTASK: Task already exists (idempotency): " + taskName);
+                logger.info("CLOUDTASK: Task already exists (idempotency): " + taskName);
                 return true; // Treat as success
             } else {
-                System.err.println("CLOUDTASK: Cloud Tasks call failed with code " + responseCode);
+                logger.severe("CLOUDTASK: Cloud Tasks call failed with code " + responseCode);
                 return false;
             }
         } catch (Exception e) {
-            System.err.println("CLOUDTASK: Exception calling Cloud Tasks: " + e.getMessage());
-            e.printStackTrace();
+            logger.log(Level.SEVERE, "CLOUDTASK: Exception calling Cloud Tasks: " + e.getMessage(), e);
             return false;
         }
     }
