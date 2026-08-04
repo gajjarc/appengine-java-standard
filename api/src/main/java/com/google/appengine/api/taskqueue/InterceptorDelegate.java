@@ -549,7 +549,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
         long etaUsec = addRequest.getEtaUsec();
         
         StringBuilder jsonBuilder = new StringBuilder();
-        jsonBuilder.append("{");
+        jsonBuilder.append("{\"task\": {");
         jsonBuilder.append("\"name\": \"").append(fullQueueName).append("/tasks/").append(taskName).append("\",");
         jsonBuilder.append("\"appEngineHttpRequest\": {");
         jsonBuilder.append("\"appEngineRouting\": {");
@@ -604,7 +604,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
             }
             jsonBuilder.append("}");
         }
-        jsonBuilder.append("}");
+        jsonBuilder.append("}}");
         return jsonBuilder.toString();
     }
 }
