@@ -150,7 +150,7 @@ public class TaskProcessor {
         return (localRegion != null && !localRegion.isEmpty()) ? localRegion : "us-central1";
     }
 
-    private static boolean callCloudTasks(String queueName, String payload, long entityId, String taskName) {
+    public static boolean callCloudTasks(String queueName, String payload, long entityId, String taskName) {
         String projectId = getProjectId();
         String location = getLocation();
         String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
@@ -200,6 +200,25 @@ public class TaskProcessor {
             }
         } catch (Exception e) {
             logger.log(Level.SEVERE, "CLOUDTASK: Exception calling Cloud Tasks: " + e.getMessage(), e);
+            return false;
+        }
+    }
+
+    public static boolean deleteCloudTask(String fullTaskName) {
+        try {
+            AppIdentityService appIdentityService = AppIdentityServiceFactory.getAppIdentityService();
+            AppIdentityService.GetAccessTokenResult tokenResult = appIdentityService.getAccessToken(Arrays.asList("https://www.googleapis.com/auth/cloud-platform"));
+            String token = tokenResult.getAccessToken();
+            
+            java.net.URL url = new java.net.URL("https://cloudtasks.googleapis.com/v2beta3/" + fullTaskName);
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("DELETE");
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            
+            int responseCode = conn.getResponseCode();
+            return (responseCode == 200 || responseCode == 204 || responseCode == 404);
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "CLOUDTASK: Exception deleting Cloud Task " + fullTaskName, e);
             return false;
         }
     }
