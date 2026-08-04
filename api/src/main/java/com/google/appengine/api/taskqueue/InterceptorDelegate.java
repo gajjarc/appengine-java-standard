@@ -176,8 +176,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                 }
             }
         } else if ("taskqueue".equals(packageName) && "Delete".equals(methodName)) {
-            String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
-            if ("CLOUD_TASK".equals(backend)) {
+            if (isCloudTaskBackend()) {
                 logger.info("*** CLOUDTASK INTERCEPTED DELETE ***");
                 TaskQueueDeleteResponse.Builder responseBuilder = TaskQueueDeleteResponse.newBuilder();
                 TaskQueueDeleteRequest deleteRequest = null;
@@ -209,8 +208,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                 }
             }
         } else if ("taskqueue".equals(packageName) && "FetchQueueStats".equals(methodName)) {
-            String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
-            if ("CLOUD_TASK".equals(backend)) {
+            if (isCloudTaskBackend()) {
                 logger.info("*** CLOUDTASK INTERCEPTED FETCH STATS ***");
                 try {
                     TaskQueueFetchQueueStatsRequest statsRequest = TaskQueueFetchQueueStatsRequest.parseFrom(request);
@@ -303,8 +301,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                 }
             }
         } else if ("taskqueue".equals(packageName) && "PurgeQueue".equals(methodName)) {
-            String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
-            if ("CLOUD_TASK".equals(backend)) {
+            if (isCloudTaskBackend()) {
                 logger.info("*** CLOUDTASK INTERCEPTED PURGE ***");
                 try {
                     TaskQueuePurgeQueueRequest purgeRequest = TaskQueuePurgeQueueRequest.parseFrom(request);
