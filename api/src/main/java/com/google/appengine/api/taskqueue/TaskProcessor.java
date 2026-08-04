@@ -63,8 +63,10 @@ public class TaskProcessor {
         long entityId = key.getId();
         
         boolean success = false;
+        com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode resCode = com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.INTERNAL_ERROR;
         try {
-            success = callCloudTasks(queueName, payload, entityId, (String) entity.getProperty("cloud_task_name"));
+            resCode = callCloudTasks(queueName, payload, entityId, (String) entity.getProperty("cloud_task_name"));
+            success = (resCode == com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.OK);
         } catch (Exception ex) {
             logger.log(Level.SEVERE, "CLOUDTASK: Exception during REST dispatch for task " + entityId + ": " + ex.getMessage(), ex);
             success = false;
@@ -82,7 +84,7 @@ public class TaskProcessor {
                 long retryCount = (retryObj instanceof Number) ? ((Number) retryObj).longValue() : 0L;
                 retryCount++;
                 entity.setProperty("retry_count", retryCount);
-                entity.setProperty("last_error", "Cloud Tasks REST call failed");
+                entity.setProperty("last_error", "Cloud Tasks REST call failed with " + resCode);
                 if (retryCount >= 5L) {
                     entity.setProperty("status", "FAILED");
                 } else {
@@ -150,7 +152,7 @@ public class TaskProcessor {
         return (localRegion != null && !localRegion.isEmpty()) ? localRegion : "us-central1";
     }
 
-    public static boolean callCloudTasks(String queueName, String payload, long entityId, String taskName) {
+    public static com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode callCloudTasks(String queueName, String payload, long entityId, String taskName) {
         String projectId = getProjectId();
         String location = getLocation();
         String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + queueName;
@@ -190,17 +192,28 @@ public class TaskProcessor {
             
             int responseCode = conn.getResponseCode();
             if (responseCode == 200 || responseCode == 201) {
-                return true;
+                return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.OK;
             } else if (responseCode == 409) {
                 logger.info("CLOUDTASK: Task already exists (idempotency): " + taskName);
-                return true; // Treat as success
+                return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
+            } else if (responseCode == 400 || responseCode == 404) {
+                String errStr = "";
+                try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.InputStreamReader(conn.getErrorStream(), "utf-8"))) {
+                    String line;
+                    while ((line = br.readLine()) != null) errStr += line;
+                } catch (Exception ignore) {}
+                logger.info("CLOUDTASK: Error " + responseCode + ": " + errStr);
+                if (errStr.contains("Queue") || errStr.contains("queue") || errStr.contains("NOT_FOUND") || responseCode == 404) {
+                    return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE;
+                }
+                return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.INTERNAL_ERROR;
             } else {
                 logger.severe("CLOUDTASK: Cloud Tasks call failed with code " + responseCode);
-                return false;
+                return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.INTERNAL_ERROR;
             }
         } catch (Exception e) {
             logger.log(Level.SEVERE, "CLOUDTASK: Exception calling Cloud Tasks: " + e.getMessage(), e);
-            return false;
+            return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.INTERNAL_ERROR;
         }
     }
 

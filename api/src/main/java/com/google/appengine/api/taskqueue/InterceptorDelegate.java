@@ -171,17 +171,10 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                             List<String> chunkJsons = taskJsons.subList(chunkStart, chunkEnd);
                             List<String> chunkNames = taskNames.subList(chunkStart, chunkEnd);
 
-                            boolean allSuccess = true;
                             for (int i = 0; i < chunkJsons.size(); i++) {
                                 String taskName = chunkNames.get(i);
                                 String taskJson = chunkJsons.get(i);
-                                boolean ok = TaskProcessor.callCloudTasks(queueName, taskJson, 0L, taskName);
-                                if (!ok) {
-                                    allSuccess = false;
-                                }
-                            }
-                            TaskQueueServiceError.ErrorCode errorCode = allSuccess ? TaskQueueServiceError.ErrorCode.OK : TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
-                            for (String taskName : chunkNames) {
+                                TaskQueueServiceError.ErrorCode errorCode = TaskProcessor.callCloudTasks(queueName, taskJson, 0L, taskName);
                                 responseBuilder.addTaskResult(TaskQueueBulkAddResponse.TaskResult.newBuilder()
                                     .setResult(errorCode)
                                     .setChosenTaskName(ByteString.copyFromUtf8(taskName))

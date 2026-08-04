@@ -581,17 +581,18 @@ class QueueImpl implements Queue {
             if (taskqueueException == null
                 || taskqueueException instanceof TaskAlreadyExistsException) {
               int result = taskResult.getResult().getNumber();
+              String chosenName = taskResult.hasChosenTaskName() ? taskResult.getChosenTaskName().toStringUtf8() : options.getTaskName();
               String detail =
                   (result == TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE_VALUE)
                       ? queueName
-                      : options.getTaskName();
+                      : chosenName;
               RuntimeException e = QueueApiHelper.translateError(result, detail);
               if (e instanceof TaskAlreadyExistsException) {
                 if (taskqueueException == null) {
                   taskqueueException = e;
                 }
                 if (taskqueueException instanceof TaskAlreadyExistsException taee) {
-                  taee.appendTaskName(options.getTaskName());
+                  taee.appendTaskName(chosenName);
                 }
               } else {
                 taskqueueException = e;
