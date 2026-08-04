@@ -15,13 +15,32 @@ import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+/**
+ * Processor utility responsible for executing and dispatching pending Cloud Tasks stored in Datastore
+ * (`_AE_PendingCloudTask`) to Google Cloud Tasks via its REST API.
+ *
+ * <p>Handles task state transitions (`PENDING`, `PROCESSING`, `DONE`, `FAILED`), exponential backoff retry
+ * tracking, GCP project and region discovery, and direct HTTP invocation of the Cloud Tasks API.
+ */
 public class TaskProcessor {
     private static final Logger logger = Logger.getLogger(TaskProcessor.class.getName());
 
+    /**
+     * Processes a list of pending task entity IDs stored in Datastore.
+     *
+     * @param ids the list of Datastore entity IDs for `_AE_PendingCloudTask` entities to process
+     */
     public static void processPendingTasks(List<Long> ids) {
         processPendingTasks(ids, false);
     }
     
+    /**
+     * Processes a list of pending task entity IDs stored in Datastore, indicating whether invocation
+     * originated from the background sweeper cron job.
+     *
+     * @param ids the list of Datastore entity IDs for `_AE_PendingCloudTask` entities to process
+     * @param handledBySweeper {@code true} if triggered by the cron sweeper; {@code false} if triggered by fast-path
+     */
     public static void processPendingTasks(List<Long> ids, boolean handledBySweeper) {
         DatastoreService ds = DatastoreServiceFactory.getDatastoreService();
         for (Long id : ids) {
@@ -103,6 +122,11 @@ public class TaskProcessor {
         }
     }
     
+    /**
+     * Resolves the current Google Cloud Platform project ID from the App Engine runtime environment.
+     *
+     * @return the GCP project ID string
+     */
     public static String getProjectId() {
         String appId = ApiProxy.getCurrentEnvironment().getAppId();
         if (appId != null && appId.contains("~")) {
@@ -111,6 +135,12 @@ public class TaskProcessor {
         return appId;
     }
 
+    /**
+     * Resolves the current App Engine deployment location/region from environment variables, system properties,
+     * or the GCP instance metadata server.
+     *
+     * @return the GCP region ID (e.g. {@code "us-central1"}, {@code "us-east1"})
+     */
     public static String getLocation() {
         String location = System.getenv("LOCATION_ID");
         if (location != null && !location.isEmpty()) {
@@ -152,6 +182,17 @@ public class TaskProcessor {
         return (localRegion != null && !localRegion.isEmpty()) ? localRegion : "us-central1";
     }
 
+    /**
+     * Dispatches a single push task directly to Google Cloud Tasks via HTTP POST using End-User/App-Identity
+     * OAuth2 credentials.
+     *
+     * @param queueName the target task queue name
+     * @param payload the JSON task payload formatted for Cloud Tasks REST API
+     * @param entityId the Datastore entity ID for logging/fallback naming
+     * @param taskName the chosen task name or {@code null} for auto-generation
+     * @return a {@link com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode}
+     *         indicating success or specific failure reason (e.g. {@code OK}, {@code TASK_ALREADY_EXISTS}, {@code UNKNOWN_QUEUE})
+     */
     public static com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode callCloudTasks(String queueName, String payload, long entityId, String taskName) {
         String projectId = getProjectId();
         String location = getLocation();

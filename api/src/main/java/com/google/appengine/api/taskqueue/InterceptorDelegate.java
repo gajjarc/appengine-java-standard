@@ -35,11 +35,22 @@ import com.google.appengine.api.datastore.Entity;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+/**
+ * Custom App Engine {@link ApiProxy.Delegate} that intercepts {@code taskqueue} RPC calls (such as
+ * {@code BulkAdd}, {@code Delete}, {@code FetchQueueStats}, and {@code PurgeQueue}) and transparently
+ * routes push queue operations to Google Cloud Tasks via the REST/Client SDK while delegating Datastore
+ * transaction lifecycle calls and pull queue calls to the underlying delegate.
+ */
 public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environment> {
     private static final Logger logger = Logger.getLogger(InterceptorDelegate.class.getName());
     private static final Map<String, List<Long>> pendingTasksPerTxn = new java.util.concurrent.ConcurrentHashMap<>();
     private final ApiProxy.Delegate<ApiProxy.Environment> originalDelegate;
 
+    /**
+     * Constructs a new {@code InterceptorDelegate} wrapping the specified original API proxy delegate.
+     *
+     * @param originalDelegate the underlying {@link ApiProxy.Delegate} to delegate unhandled or non-taskqueue API calls to
+     */
     @SuppressWarnings("unchecked")
     public InterceptorDelegate(ApiProxy.Delegate<?> originalDelegate) {
         this.originalDelegate = (ApiProxy.Delegate<ApiProxy.Environment>) originalDelegate;
@@ -77,6 +88,17 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
         return false;
     }
 
+    /**
+     * Intercepts synchronous API proxy calls, routing push queue operations (such as {@code BulkAdd},
+     * {@code Delete}, and {@code FetchQueueStats}) to Cloud Tasks while passing pull queues and other services
+     * to the original delegate.
+     *
+     * @param environment the current App Engine API execution environment
+     * @param packageName the API service package name (e.g. {@code "taskqueue"})
+     * @param methodName the API service method name (e.g. {@code "BulkAdd"})
+     * @param request the serialized request protocol buffer bytes
+     * @return the serialized response protocol buffer bytes
+     */
     @Override
     public byte[] makeSyncCall(ApiProxy.Environment environment, String packageName, String methodName, byte[] request) {
         logger.fine("*** CLOUDTASK CALL: " + packageName + "." + methodName + " ***");
@@ -395,6 +417,17 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
         return originalDelegate.makeSyncCall(environment, packageName, methodName, request);
     }
 
+    /**
+     * Intercepts asynchronous API proxy calls, handling transactional push queue enqueue operations or
+     * delegating asynchronous API calls to the underlying API proxy delegate.
+     *
+     * @param environment the current App Engine API execution environment
+     * @param packageName the API service package name (e.g. {@code "taskqueue"})
+     * @param methodName the API service method name (e.g. {@code "BulkAdd"})
+     * @param request the serialized request protocol buffer bytes
+     * @param apiConfig the API execution configuration
+     * @return a {@link Future} resolving to the serialized response protocol buffer bytes
+     */
     @Override
     public Future<byte[]> makeAsyncCall(ApiProxy.Environment environment, String packageName, String methodName, byte[] request, ApiProxy.ApiConfig apiConfig) {
         logger.fine("*** CLOUDTASK ASYNC CALL: " + packageName + "." + methodName + " ***");
@@ -482,16 +515,33 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
         return originalDelegate.makeAsyncCall(environment, packageName, methodName, request, apiConfig);
     }
 
+    /**
+     * Delegates log record emission to the underlying API proxy delegate.
+     *
+     * @param environment the current App Engine API execution environment
+     * @param record the log record to emit
+     */
     @Override
     public void log(ApiProxy.Environment environment, ApiProxy.LogRecord record) {
         originalDelegate.log(environment, record);
     }
 
+    /**
+     * Delegates log flushing to the underlying API proxy delegate.
+     *
+     * @param environment the current App Engine API execution environment
+     */
     @Override
     public void flushLogs(ApiProxy.Environment environment) {
         originalDelegate.flushLogs(environment);
     }
 
+    /**
+     * Delegates request thread discovery to the underlying API proxy delegate.
+     *
+     * @param environment the current App Engine API execution environment
+     * @return a list of request threads associated with the environment
+     */
     @Override
     public List<Thread> getRequestThreads(ApiProxy.Environment environment) {
         return originalDelegate.getRequestThreads(environment);

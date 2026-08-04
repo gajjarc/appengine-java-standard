@@ -7,9 +7,25 @@ import javax.servlet.ServletContainerInitializer;
 import javax.servlet.ServletContext;
 import javax.servlet.ServletException;
 
+/**
+ * Servlet container initializer responsible for transparently bootstrapping the Cloud Tasks push queue
+ * interceptor and registering background components upon web application startup.
+ *
+ * <p>Registers the {@link InterceptorDelegate} into App Engine's {@link ApiProxy}, as well as the
+ * {@link SweeperServlet} for cron-driven fallback task processing and the {@link RequestCachingFilter}
+ * for caching incoming push task request payloads.
+ */
 public class InterceptorInitializer implements ServletContainerInitializer {
     private static final Logger logger = Logger.getLogger(InterceptorInitializer.class.getName());
 
+    /**
+     * Invoked automatically by the Servlet container on web application startup to register
+     * API proxy delegates, background worker servlets, and request filters.
+     *
+     * @param c the set of application classes found that match any criteria specified by annotations
+     * @param ctx the servlet context of the web application being initialized
+     * @throws ServletException if initialization of servlets or filters fails
+     */
     @Override
     public void onStartup(java.util.Set<Class<?>> c, javax.servlet.ServletContext ctx) throws javax.servlet.ServletException {
         ApiProxy.Delegate originalDelegate = ApiProxy.getDelegate();

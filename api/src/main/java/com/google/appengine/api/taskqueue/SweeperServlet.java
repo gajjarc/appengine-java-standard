@@ -15,9 +15,25 @@ import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
+/**
+ * Servlet endpoint invoked by App Engine Cron to periodically query and process pending Cloud Tasks
+ * stored in Datastore (`_AE_PendingCloudTask`).
+ *
+ * <p>Acts as a reliable background sweeper to recover and dispatch transactional or delayed push tasks
+ * that were not immediately dispatched by fast-path execution.
+ */
 public class SweeperServlet extends HttpServlet {
     private static final Logger logger = Logger.getLogger(SweeperServlet.class.getName());
 
+    /**
+     * Handles HTTP GET requests from App Engine Cron to sweep pending task entities from Datastore
+     * and dispatch them to Cloud Tasks.
+     *
+     * @param req the HTTP request issued by the App Engine Cron infrastructure
+     * @param resp the HTTP response returned to the cron infrastructure
+     * @throws ServletException if a servlet processing exception occurs
+     * @throws IOException if an I/O error occurs writing the response
+     */
     @Override
     protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
         String cronHeader = req.getHeader("X-AppEngine-Cron");
