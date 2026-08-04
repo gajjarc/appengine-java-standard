@@ -56,46 +56,13 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
         this.originalDelegate = (ApiProxy.Delegate<ApiProxy.Environment>) originalDelegate;
     }
 
-    private boolean isPullQueueRequest(String methodName, byte[] request) {
-        try {
-            if ("BulkAdd".equals(methodName)) {
-                TaskQueueBulkAddRequest bulkRequest = TaskQueueBulkAddRequest.parseFrom(request);
-                if (bulkRequest.getAddRequestCount() > 0) {
-                    TaskQueueAddRequest req0 = bulkRequest.getAddRequest(0);
-                    if (req0.getMode() == TaskQueueMode.Mode.PULL || (req0.hasQueueName() && req0.getQueueName().toStringUtf8().toLowerCase().contains("pull"))) {
-                        return true;
-                    }
-                }
-            } else if ("Delete".equals(methodName)) {
-                TaskQueueDeleteRequest deleteRequest = TaskQueueDeleteRequest.parseFrom(request);
-                if (deleteRequest.hasQueueName() && deleteRequest.getQueueName().toStringUtf8().toLowerCase().contains("pull")) {
-                    return true;
-                }
-            } else if ("FetchQueueStats".equals(methodName)) {
-                TaskQueueFetchQueueStatsRequest statsRequest = TaskQueueFetchQueueStatsRequest.parseFrom(request);
-                if (statsRequest.getQueueNameCount() > 0 && statsRequest.getQueueName(0).toStringUtf8().toLowerCase().contains("pull")) {
-                    return true;
-                }
-            } else if ("PurgeQueue".equals(methodName)) {
-                TaskQueuePurgeQueueRequest purgeRequest = TaskQueuePurgeQueueRequest.parseFrom(request);
-                if (purgeRequest.hasQueueName() && purgeRequest.getQueueName().toStringUtf8().toLowerCase().contains("pull")) {
-                    return true;
-                }
-            }
-        } catch (Exception e) {
-            logger.log(Level.WARNING, "CLOUDTASK: Error checking pull queue request", e);
-        }
-        return false;
-    }
-
     private static boolean isCloudTaskBackend() {
         return Boolean.parseBoolean(System.getenv("APPENGINE_USE_CLOUDTASK_PUSH_QUEUE"));
     }
 
     /**
-     * Intercepts synchronous API proxy calls, routing push queue operations (such as {@code BulkAdd},
-     * {@code Delete}, and {@code FetchQueueStats}) to Cloud Tasks while passing pull queues and other services
-     * to the original delegate.
+     * Intercepts synchronous API proxy calls, routing push queue operations (such as {@code BulkAdd})
+     * to Cloud Tasks while passing pull queues and other services to the original delegate.
      *
      * @param environment the current App Engine API execution environment
      * @param packageName the API service package name (e.g. {@code "taskqueue"})
@@ -106,18 +73,14 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
     @Override
     public byte[] makeSyncCall(ApiProxy.Environment environment, String packageName, String methodName, byte[] request) {
         logger.fine("*** CLOUDTASK CALL: " + packageName + "." + methodName + " ***");
-        if ("taskqueue".equals(packageName) && ("BulkAdd".equals(methodName) || "Delete".equals(methodName) || "FetchQueueStats".equals(methodName) || "PurgeQueue".equals(methodName))) {
-            if (isCloudTaskBackend()) {
-                if (isPullQueueRequest(methodName, request)) {
-                    return originalDelegate.makeSyncCall(environment, packageName, methodName, request);
-                }
-            }
-        }
         if ("taskqueue".equals(packageName) && "BulkAdd".equals(methodName)) {
             if (isCloudTaskBackend()) {
-                logger.info("*** CLOUDTASK INTERCEPTED ***");
                 try {
                     TaskQueueBulkAddRequest bulkRequest = TaskQueueBulkAddRequest.parseFrom(request);
+                    if (bulkRequest.getAddRequestCount() > 0 && bulkRequest.getAddRequest(0).getMode() == TaskQueueMode.Mode.PULL) {
+                        return originalDelegate.makeSyncCall(environment, packageName, methodName, request);
+                    }
+                    logger.info("*** CLOUDTASK INTERCEPTED ***");
                     TaskQueueBulkAddResponse.Builder responseBuilder = TaskQueueBulkAddResponse.newBuilder();
                     
                     String projectId = TaskProcessor.getProjectId();
@@ -433,28 +396,26 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
     @Override
     public Future<byte[]> makeAsyncCall(ApiProxy.Environment environment, String packageName, String methodName, byte[] request, ApiProxy.ApiConfig apiConfig) {
         logger.fine("*** CLOUDTASK ASYNC CALL: " + packageName + "." + methodName + " ***");
-        if ("taskqueue".equals(packageName) && ("BulkAdd".equals(methodName) || "Delete".equals(methodName) || "FetchQueueStats".equals(methodName) || "PurgeQueue".equals(methodName))) {
+        if ("taskqueue".equals(packageName) && "BulkAdd".equals(methodName)) {
             if (isCloudTaskBackend()) {
-                if (isPullQueueRequest(methodName, request)) {
-                    return originalDelegate.makeAsyncCall(environment, packageName, methodName, request, apiConfig);
-                }
-                if ("BulkAdd".equals(methodName)) {
-                    try {
-                        TaskQueueBulkAddRequest bulkRequest = TaskQueueBulkAddRequest.parseFrom(request);
-                        boolean isTransactional = false;
-                        for (TaskQueueAddRequest addReq : bulkRequest.getAddRequestList()) {
-                            if (addReq.hasTransaction()) {
-                                isTransactional = true;
-                                break;
-                            }
-                        }
-                        if (isTransactional) {
-                            logger.info("*** CLOUDTASK: Running BulkAdd synchronously for transactional task ***");
-                            return java.util.concurrent.CompletableFuture.completedFuture(makeSyncCall(environment, packageName, methodName, request));
-                        }
-                    } catch (Exception e) {
-                        logger.warning("*** CLOUDTASK: Failed to parse BulkAdd in makeAsyncCall: " + e.getMessage() + " ***");
+                try {
+                    TaskQueueBulkAddRequest bulkRequest = TaskQueueBulkAddRequest.parseFrom(request);
+                    if (bulkRequest.getAddRequestCount() > 0 && bulkRequest.getAddRequest(0).getMode() == TaskQueueMode.Mode.PULL) {
+                        return originalDelegate.makeAsyncCall(environment, packageName, methodName, request, apiConfig);
                     }
+                    boolean isTransactional = false;
+                    for (TaskQueueAddRequest addReq : bulkRequest.getAddRequestList()) {
+                        if (addReq.hasTransaction()) {
+                            isTransactional = true;
+                            break;
+                        }
+                    }
+                    if (isTransactional) {
+                        logger.info("*** CLOUDTASK: Running BulkAdd synchronously for transactional task ***");
+                        return java.util.concurrent.CompletableFuture.completedFuture(makeSyncCall(environment, packageName, methodName, request));
+                    }
+                } catch (Exception e) {
+                    logger.warning("*** CLOUDTASK: Failed to parse BulkAdd in makeAsyncCall: " + e.getMessage() + " ***");
                 }
                 
                 ApiProxy.Environment env = ApiProxy.getCurrentEnvironment();
