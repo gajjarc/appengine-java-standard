@@ -88,6 +88,10 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
         return false;
     }
 
+    private static boolean isCloudTaskBackend() {
+        return Boolean.parseBoolean(System.getenv("APPENGINE_USE_CLOUDTASK_PUSH_QUEUE"));
+    }
+
     /**
      * Intercepts synchronous API proxy calls, routing push queue operations (such as {@code BulkAdd},
      * {@code Delete}, and {@code FetchQueueStats}) to Cloud Tasks while passing pull queues and other services
@@ -103,16 +107,14 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
     public byte[] makeSyncCall(ApiProxy.Environment environment, String packageName, String methodName, byte[] request) {
         logger.fine("*** CLOUDTASK CALL: " + packageName + "." + methodName + " ***");
         if ("taskqueue".equals(packageName) && ("BulkAdd".equals(methodName) || "Delete".equals(methodName) || "FetchQueueStats".equals(methodName) || "PurgeQueue".equals(methodName))) {
-            String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
-            if ("CLOUD_TASK".equals(backend)) {
+            if (isCloudTaskBackend()) {
                 if (isPullQueueRequest(methodName, request)) {
                     return originalDelegate.makeSyncCall(environment, packageName, methodName, request);
                 }
             }
         }
         if ("taskqueue".equals(packageName) && "BulkAdd".equals(methodName)) {
-            String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
-            if ("CLOUD_TASK".equals(backend)) {
+            if (isCloudTaskBackend()) {
                 logger.info("*** CLOUDTASK INTERCEPTED ***");
                 try {
                     TaskQueueBulkAddRequest bulkRequest = TaskQueueBulkAddRequest.parseFrom(request);
@@ -432,8 +434,7 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
     public Future<byte[]> makeAsyncCall(ApiProxy.Environment environment, String packageName, String methodName, byte[] request, ApiProxy.ApiConfig apiConfig) {
         logger.fine("*** CLOUDTASK ASYNC CALL: " + packageName + "." + methodName + " ***");
         if ("taskqueue".equals(packageName) && ("BulkAdd".equals(methodName) || "Delete".equals(methodName) || "FetchQueueStats".equals(methodName) || "PurgeQueue".equals(methodName))) {
-            String backend = System.getenv("GAE_PUSHQUEUE_BACKEND");
-            if ("CLOUD_TASK".equals(backend)) {
+            if (isCloudTaskBackend()) {
                 if (isPullQueueRequest(methodName, request)) {
                     return originalDelegate.makeAsyncCall(environment, packageName, methodName, request, apiConfig);
                 }
