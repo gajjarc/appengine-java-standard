@@ -172,34 +172,35 @@ public class InterceptorDelegate implements ApiProxy.Delegate<ApiProxy.Environme
                                 .build());
                         }
                     } else {
+                        String serviceName = environment.getModuleId();
                         int chunkSize = 100;
-                        for (int chunkStart = 0; chunkStart < addRequest.getTaskCount(); chunkStart += chunkSize) {
-                            int chunkEnd = Math.min(chunkStart + chunkSize, addRequest.getTaskCount());
+                        for (int chunkStart = 0; chunkStart < bulkRequest.getAddRequestCount(); chunkStart += chunkSize) {
+                            int chunkEnd = Math.min(chunkStart + chunkSize, bulkRequest.getAddRequestCount());
                             try (CloudTasksClient client = CloudTasksClient.create()) {
                                 List<CreateTaskRequest> requests = new ArrayList<>();
                                 List<String> chunkNames = new ArrayList<>();
                                 for (int i = chunkStart; i < chunkEnd; i++) {
-                                    TaskQueueAddRequest.Task taskReq = addRequest.getTask(i);
-                                    String taskName = taskReq.hasTaskName() ? taskReq.getTaskName().toStringUtf8() : "task-" + java.util.UUID.randomUUID().toString();
+                                    TaskQueueAddRequest addRequest = bulkRequest.getAddRequest(i);
+                                    String taskName = taskNames.get(i);
                                     chunkNames.add(taskName);
                                     
                                     AppEngineHttpRequest.Builder httpReqBuilder = AppEngineHttpRequest.newBuilder()
-                                        .setRelativeUri(taskReq.getUrl().toStringUtf8())
+                                        .setRelativeUri(addRequest.getUrl().toStringUtf8())
                                         .setHttpMethod(HttpMethod.POST)
-                                        .setBody(taskReq.getBody());
+                                        .setBody(addRequest.getBody());
                                     if (serviceName != null && !serviceName.isEmpty()) {
                                         httpReqBuilder.setAppEngineRouting(AppEngineRouting.newBuilder().setService(serviceName).build());
                                     }
-                                    for (int j = 0; j < taskReq.getHeaderCount(); j++) {
-                                        httpReqBuilder.putHeaders(taskReq.getHeader(j).getKey().toStringUtf8(), taskReq.getHeader(j).getValue().toStringUtf8());
+                                    for (int j = 0; j < addRequest.getHeaderCount(); j++) {
+                                        httpReqBuilder.putHeaders(addRequest.getHeader(j).getKey().toStringUtf8(), addRequest.getHeader(j).getValue().toStringUtf8());
                                     }
-                                    Task.Builder taskBuilder = Task.newBuilder()
+                                    com.google.cloud.tasks.v2beta3.Task.Builder taskBuilder = com.google.cloud.tasks.v2beta3.Task.newBuilder()
                                         .setName(fullQueueName + "/tasks/" + taskName)
                                         .setAppEngineHttpRequest(httpReqBuilder.build());
-                                    if (taskReq.getEtaUsec() > 0) {
+                                    if (addRequest.getEtaUsec() > 0) {
                                         taskBuilder.setScheduleTime(com.google.protobuf.Timestamp.newBuilder()
-                                            .setSeconds(taskReq.getEtaUsec() / 1000000L)
-                                            .setNanos((int) ((taskReq.getEtaUsec() % 1000000L) * 1000))
+                                            .setSeconds(addRequest.getEtaUsec() / 1000000L)
+                                            .setNanos((int) ((addRequest.getEtaUsec() % 1000000L) * 1000))
                                             .build());
                                     }
                                     requests.add(CreateTaskRequest.newBuilder()
