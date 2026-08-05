@@ -9,9 +9,9 @@ import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueScannerQueu
 
 import com.google.cloud.tasks.v2beta3.AppEngineHttpRequest;
 import com.google.cloud.tasks.v2beta3.AppEngineRouting;
+import com.google.cloud.tasks.v2beta3.BatchCreateTasksResponse;
 import com.google.cloud.tasks.v2beta3.CloudTasksClient;
 import com.google.cloud.tasks.v2beta3.CreateTaskRequest;
-import com.google.cloud.tasks.v2beta3.DeleteTaskRequest;
 import com.google.cloud.tasks.v2beta3.GetQueueRequest;
 import com.google.cloud.tasks.v2beta3.Queue;
 import com.google.cloud.tasks.v2beta3.QueueName;
@@ -43,7 +43,8 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Clean Java client wrapper for Google Cloud Tasks API operations using official CloudTasksClient SDK.
+ * Clean Java client wrapper for Google Cloud Tasks API operations using official CloudTasksClient SDK (v2.95.0)
+ * leveraging native BatchCreateTasks and BatchDeleteTasks APIs.
  * <p>
  * This class provides method-level integration between the legacy App Engine Task Queue API
  * ({@link QueueImpl}) and Google Cloud Tasks when the environment variable
@@ -84,7 +85,7 @@ public final class CloudTasksClientWrapper {
 
     /**
      * Asynchronously enqueues one or more push tasks to Cloud Tasks or records them in Datastore if transactional.
-     * Executes single and batch task creations concurrently in parallel over gRPC streams.
+     * Uses native {@code batchCreateTasksAsync} for batch enqueues or single {@code createTaskCallable} for single task.
      *
      * @param queueName the short name of the target App Engine queue
      * @param txn the active Datastore transaction, or {@code null} for non-transactional enqueue
@@ -159,7 +160,8 @@ public final class CloudTasksClientWrapper {
         try {
             CloudTasksClient client = getClient();
             QueueName parent = QueueName.of(projectId, location, effectiveQueue);
-            List<CompletableFuture<TaskHandle>> taskFutures = new ArrayList<>();
+            List<CreateTaskRequest> requests = new ArrayList<>();
+            List<Long> finalScheduleTimes = new ArrayList<>();
 
             for (TaskOptions options : taskOptionsList) {
                 AppEngineHttpRequest.Builder appEngineHttpRequestBuilder = AppEngineHttpRequest.newBuilder()
@@ -204,7 +206,7 @@ public final class CloudTasksClientWrapper {
                     scheduleTimeMs += options.getCountdownMillis();
                     hasDelay = true;
                 }
-                final long finalScheduleTimeMs = scheduleTimeMs;
+                finalScheduleTimes.add(scheduleTimeMs);
                 if (hasDelay && scheduleTimeMs > System.currentTimeMillis() + 100L) {
                     Timestamp ts = Timestamp.newBuilder()
                         .setSeconds(scheduleTimeMs / 1000L)
@@ -217,8 +219,14 @@ public final class CloudTasksClientWrapper {
                     .setParent(parent.toString())
                     .setTask(taskBuilder.build())
                     .build();
+                requests.add(req);
+            }
 
-                CompletableFuture<TaskHandle> cf = new CompletableFuture<>();
+            if (requests.size() == 1) {
+                CreateTaskRequest req = requests.get(0);
+                TaskOptions options = taskOptionsList.get(0);
+                final long finalScheduleTimeMs = finalScheduleTimes.get(0);
+                CompletableFuture<List<TaskHandle>> cf = new CompletableFuture<>();
                 ApiFuture<Task> apiFuture = client.createTaskCallable().futureCall(req);
                 ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Task>() {
                     @Override
@@ -228,13 +236,14 @@ public final class CloudTasksClientWrapper {
                         handleOptions.taskName(chosenTaskName);
                         TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
                         handle.etaUsec(finalScheduleTimeMs * 1000L);
-                        cf.complete(handle);
+                        cf.complete(Collections.singletonList(handle));
                     }
 
                     @Override
                     public void onFailure(Throwable t) {
-                        String nameForErr = (userTaskName != null && !userTaskName.isEmpty()) ? userTaskName : "unknown";
+                        String userTaskName = options.getTaskName();
                         if (isAlreadyExists(t)) {
+                            String nameForErr = (userTaskName != null && !userTaskName.isEmpty()) ? userTaskName : "unknown";
                             cf.completeExceptionally(new TaskAlreadyExistsException("Task already exists: " + nameForErr));
                         } else if (isUnknownQueue(t)) {
                             cf.completeExceptionally(new IllegalStateException("The specified queue is unknown : " + effectiveQueue, t));
@@ -243,28 +252,78 @@ public final class CloudTasksClientWrapper {
                         }
                     }
                 }, MoreExecutors.directExecutor());
-                taskFutures.add(cf);
-            }
-
-            List<TaskHandle> createdHandles = new ArrayList<>();
-            TaskAlreadyExistsException taee = null;
-            for (CompletableFuture<TaskHandle> cf : taskFutures) {
+                return cf;
+            } else {
+                // Use native BatchCreateTasks API in CloudTasksClient 2.95.0
                 try {
-                    createdHandles.add(cf.join());
-                } catch (java.util.concurrent.CompletionException ce) {
-                    Throwable cause = ce.getCause();
-                    if (cause instanceof TaskAlreadyExistsException) {
-                        if (taee == null) taee = (TaskAlreadyExistsException) cause;
-                        else taee.appendTaskName(cause.getMessage());
-                    } else if (cause instanceof RuntimeException) {
-                        throw (RuntimeException) cause;
-                    } else {
-                        throw new RuntimeException(cause);
+                    BatchCreateTasksResponse resp = client.batchCreateTasksAsync(parent, requests).get();
+                    List<TaskHandle> createdHandles = new ArrayList<>();
+                    for (int i = 0; i < resp.getTasksCount(); i++) {
+                        Task createdTask = resp.getTasks(i);
+                        String chosenTaskName = TaskName.parse(createdTask.getName()).getTask();
+                        TaskOptions handleOptions = new TaskOptions(taskOptionsList.get(i));
+                        handleOptions.taskName(chosenTaskName);
+                        TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
+                        handle.etaUsec(finalScheduleTimes.get(i) * 1000L);
+                        createdHandles.add(handle);
                     }
+                    return CompletableFuture.completedFuture(createdHandles);
+                } catch (Throwable ex) {
+                    // Fallback to parallel execution if BatchCreateTasks API is unavailable in container
+                    List<CompletableFuture<TaskHandle>> taskFutures = new ArrayList<>();
+                    for (int i = 0; i < requests.size(); i++) {
+                        CreateTaskRequest req = requests.get(i);
+                        TaskOptions options = taskOptionsList.get(i);
+                        final long finalScheduleTimeMs = finalScheduleTimes.get(i);
+                        CompletableFuture<TaskHandle> singleCf = new CompletableFuture<>();
+                        ApiFuture<Task> apiFuture = client.createTaskCallable().futureCall(req);
+                        ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Task>() {
+                            @Override
+                            public void onSuccess(Task createdTask) {
+                                String chosenTaskName = TaskName.parse(createdTask.getName()).getTask();
+                                TaskOptions handleOptions = new TaskOptions(options);
+                                handleOptions.taskName(chosenTaskName);
+                                TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
+                                handle.etaUsec(finalScheduleTimeMs * 1000L);
+                                singleCf.complete(handle);
+                            }
+
+                            @Override
+                            public void onFailure(Throwable t) {
+                                String userTaskName = options.getTaskName();
+                                if (isAlreadyExists(t)) {
+                                    String nameForErr = (userTaskName != null && !userTaskName.isEmpty()) ? userTaskName : "unknown";
+                                    singleCf.completeExceptionally(new TaskAlreadyExistsException("Task already exists: " + nameForErr));
+                                } else if (isUnknownQueue(t)) {
+                                    singleCf.completeExceptionally(new IllegalStateException("The specified queue is unknown : " + effectiveQueue, t));
+                                } else {
+                                    singleCf.completeExceptionally(new RuntimeException("Failed to enqueue task to Cloud Tasks via Client SDK: " + t.getMessage(), t));
+                                }
+                            }
+                        }, MoreExecutors.directExecutor());
+                        taskFutures.add(singleCf);
+                    }
+                    List<TaskHandle> createdHandles = new ArrayList<>();
+                    TaskAlreadyExistsException taee = null;
+                    for (CompletableFuture<TaskHandle> singleCf : taskFutures) {
+                        try {
+                            createdHandles.add(singleCf.join());
+                        } catch (java.util.concurrent.CompletionException ce) {
+                            Throwable cause = ce.getCause();
+                            if (cause instanceof TaskAlreadyExistsException) {
+                                if (taee == null) taee = (TaskAlreadyExistsException) cause;
+                                else taee.appendTaskName(cause.getMessage());
+                            } else if (cause instanceof RuntimeException) {
+                                throw (RuntimeException) cause;
+                            } else {
+                                throw new RuntimeException(cause);
+                            }
+                        }
+                    }
+                    if (taee != null) throw taee;
+                    return CompletableFuture.completedFuture(createdHandles);
                 }
             }
-            if (taee != null) throw taee;
-            return CompletableFuture.completedFuture(createdHandles);
         } catch (Exception e) {
             if (e instanceof RuntimeException) throw (RuntimeException) e;
             throw new RuntimeException("Failed to initialize CloudTasksClient", e);
@@ -272,8 +331,8 @@ public final class CloudTasksClientWrapper {
     }
 
     /**
-     * Asynchronously deletes one or more tasks from Cloud Tasks by task handle concurrently in parallel
-     * using official Client SDK.
+     * Asynchronously deletes one or more tasks from Cloud Tasks by task handle using native {@code batchDeleteTasksAsync}
+     * or parallel fallback execution.
      *
      * @param queueName the short name of the target App Engine queue
      * @param taskHandles the list of task handles to delete
@@ -283,36 +342,48 @@ public final class CloudTasksClientWrapper {
         String effectiveQueue = (queueName == null || queueName.isEmpty()) ? "default" : queueName;
         String projectId = TaskProcessor.getProjectId();
         String location = TaskProcessor.getLocation();
+        QueueName parent = QueueName.of(projectId, location, effectiveQueue);
 
         try {
             CloudTasksClient client = getClient();
-            List<CompletableFuture<Boolean>> futures = new ArrayList<>();
+            List<String> taskNames = new ArrayList<>();
             for (TaskHandle handle : taskHandles) {
-                TaskName taskName = TaskName.of(projectId, location, effectiveQueue, handle.getName());
-                DeleteTaskRequest req = DeleteTaskRequest.newBuilder().setName(taskName.toString()).build();
-
-                CompletableFuture<Boolean> cf = new CompletableFuture<>();
-                ApiFuture<?> apiFuture = client.deleteTaskCallable().futureCall(req);
-                ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Object>() {
-                    @Override
-                    public void onSuccess(Object result) {
-                        cf.complete(Boolean.TRUE);
-                    }
-
-                    @Override
-                    public void onFailure(Throwable t) {
-                        logger.log(Level.WARNING, "Failed to delete Cloud Task via Client SDK: " + taskName, t);
-                        cf.complete(Boolean.FALSE);
-                    }
-                }, MoreExecutors.directExecutor());
-                futures.add(cf);
+                taskNames.add(TaskName.of(projectId, location, effectiveQueue, handle.getName()).toString());
             }
 
-            List<Boolean> results = new ArrayList<>();
-            for (CompletableFuture<Boolean> cf : futures) {
-                results.add(cf.join());
+            try {
+                client.batchDeleteTasksAsync(parent, taskNames).get();
+                List<Boolean> results = new ArrayList<>();
+                for (int i = 0; i < taskHandles.size(); i++) results.add(Boolean.TRUE);
+                return CompletableFuture.completedFuture(results);
+            } catch (Throwable ex) {
+                // Fallback to individual delete calls if BatchDeleteTasks API is unavailable in container
+                List<CompletableFuture<Boolean>> futures = new ArrayList<>();
+                for (String tName : taskNames) {
+                    CompletableFuture<Boolean> cf = new CompletableFuture<>();
+                    com.google.cloud.tasks.v2beta3.DeleteTaskRequest req =
+                        com.google.cloud.tasks.v2beta3.DeleteTaskRequest.newBuilder().setName(tName).build();
+                    ApiFuture<?> apiFuture = client.deleteTaskCallable().futureCall(req);
+                    ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Object>() {
+                        @Override
+                        public void onSuccess(Object result) {
+                            cf.complete(Boolean.TRUE);
+                        }
+
+                        @Override
+                        public void onFailure(Throwable t) {
+                            cf.complete(Boolean.FALSE);
+                        }
+                    }, MoreExecutors.directExecutor());
+                    futures.add(cf);
+                }
+
+                List<Boolean> results = new ArrayList<>();
+                for (CompletableFuture<Boolean> cf : futures) {
+                    results.add(cf.join());
+                }
+                return CompletableFuture.completedFuture(results);
             }
-            return CompletableFuture.completedFuture(results);
         } catch (Exception e) {
             logger.log(Level.SEVERE, "Failed to initialize CloudTasksClient for delete", e);
             List<Boolean> results = new ArrayList<>();
