@@ -207,6 +207,11 @@ public final class TaskHandle implements Serializable {
     return options.getPayload();
   }
 
+  /** Returns the HTTP/Queue method of this task options. Can return {@code null}. */
+  public TaskOptions.Method getMethod() {
+    return options != null ? options.getMethod() : null;
+  }
+
   /**
    * Returns tag of this task. Can return {@code null}.
    *
