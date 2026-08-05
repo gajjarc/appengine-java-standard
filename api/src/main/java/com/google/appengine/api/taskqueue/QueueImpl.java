@@ -497,7 +497,6 @@ class QueueImpl implements Queue {
   /** See {@link Queue#addAsync(com.google.appengine.api.datastore.Transaction, Iterable)}. */
   @Override
   public Future<List<TaskHandle>> addAsync(Transaction txn, Iterable<TaskOptions> taskOptions) {
-    // throw new RuntimeException("UNCONDITIONAL_THROW_ADD");
     final List<TaskOptions> taskOptionsList = new ArrayList<>();
     Set<String> taskNames = new HashSet<>();
 
@@ -532,7 +531,7 @@ class QueueImpl implements Queue {
       throw new IllegalArgumentException(
           "May not add both push tasks and pull tasks in the same call.");
     }
-    if (hasPushTask && CloudTasksClientWrapper.isEnabled()) {
+    if (hasPushTask && isCloudTaskBackendEnabled()) {
       return CloudTasksClientWrapper.addAsync(queueName, txn, taskOptionsList);
     }
     TaskQueueBulkAddRequest builtRequest = bulkAddRequest.build();
@@ -706,7 +705,7 @@ class QueueImpl implements Queue {
   /** See {@link Queue#purge()}. */
   @Override
   public void purge() {
-    if (CloudTasksClientWrapper.isEnabled()) {
+    if (isCloudTaskBackendEnabled()) {
       CloudTasksClientWrapper.purge(queueName);
       return;
     }
@@ -753,7 +752,7 @@ class QueueImpl implements Queue {
   /** See {@link Queue#deleteTaskAsync(List<TaskHandle>)}. */
   @Override
   public Future<List<Boolean>> deleteTaskAsync(List<TaskHandle> taskHandles) {
-    if (CloudTasksClientWrapper.isEnabled()) {
+    if (isCloudTaskBackendEnabled()) {
       return CloudTasksClientWrapper.deleteTaskAsync(queueName, taskHandles);
     }
     final TaskQueueDeleteRequest.Builder deleteRequest =
@@ -992,5 +991,9 @@ class QueueImpl implements Queue {
   <T extends MessageLite> Future<T> makeAsyncCall(
       String methodName, MessageLite request, T responseTemplate) {
     return apiHelper.makeAsyncCall(methodName, request, responseTemplate, new ApiConfig());
+  }
+
+  private boolean isCloudTaskBackendEnabled() {
+    return CloudTasksClientWrapper.isEnabled();
   }
 }
