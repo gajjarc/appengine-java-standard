@@ -36,6 +36,10 @@ import java.util.logging.Logger;
 public class TaskProcessor {
     private static final Logger logger = Logger.getLogger(TaskProcessor.class.getName());
 
+    static {
+        System.setProperty("com.google.cloud.mtls.enabled", "false");
+    }
+
     private static volatile CloudTasksClient sharedClient;
 
     private static CloudTasksClient getClient() {

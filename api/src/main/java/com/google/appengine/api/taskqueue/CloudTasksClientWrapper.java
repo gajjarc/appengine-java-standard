@@ -57,6 +57,10 @@ public final class CloudTasksClientWrapper {
     private static final Logger logger = Logger.getLogger(CloudTasksClientWrapper.class.getName());
     private static final String ENV_VAR = "APPENGINE_USE_CLOUDTASK_PUSH_QUEUE";
 
+    static {
+        System.setProperty("com.google.cloud.mtls.enabled", "false");
+    }
+
     private static volatile CloudTasksClient sharedClient;
 
     private CloudTasksClientWrapper() {}
