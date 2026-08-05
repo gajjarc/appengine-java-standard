@@ -4,17 +4,35 @@ import com.google.appengine.api.datastore.DatastoreService;
 import com.google.appengine.api.datastore.DatastoreServiceFactory;
 import com.google.appengine.api.datastore.Entity;
 import com.google.appengine.api.datastore.Transaction;
-import com.google.appengine.api.appidentity.AppIdentityService;
-import com.google.appengine.api.appidentity.AppIdentityServiceFactory;
-import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode;
 import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueFetchQueueStatsResponse;
 import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueScannerQueueInfo;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.time.Instant;
+import com.google.cloud.tasks.v2beta3.AppEngineHttpRequest;
+import com.google.cloud.tasks.v2beta3.AppEngineRouting;
+import com.google.cloud.tasks.v2beta3.CloudTasksClient;
+import com.google.cloud.tasks.v2beta3.CreateTaskRequest;
+import com.google.cloud.tasks.v2beta3.DeleteTaskRequest;
+import com.google.cloud.tasks.v2beta3.GetQueueRequest;
+import com.google.cloud.tasks.v2beta3.Queue;
+import com.google.cloud.tasks.v2beta3.QueueName;
+import com.google.cloud.tasks.v2beta3.QueueStats;
+import com.google.cloud.tasks.v2beta3.Task;
+import com.google.cloud.tasks.v2beta3.TaskName;
+import com.google.protobuf.FieldMask;
+import com.google.protobuf.Timestamp;
+
+import com.google.api.core.ApiFuture;
+import com.google.api.core.ApiFutureCallback;
+import com.google.api.core.ApiFutures;
+import com.google.common.util.concurrent.MoreExecutors;
+
+import com.google.api.gax.rpc.AlreadyExistsException;
+import com.google.api.gax.rpc.NotFoundException;
+import com.google.api.gax.rpc.InvalidArgumentException;
+import com.google.api.gax.rpc.FailedPreconditionException;
+import com.google.api.gax.rpc.ApiException;
+import com.google.api.gax.rpc.StatusCode;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -23,11 +41,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
- * Clean Java client wrapper for Google Cloud Tasks API operations.
+ * Clean Java client wrapper for Google Cloud Tasks API operations using official CloudTasksClient SDK.
  * <p>
  * This class provides method-level integration between the legacy App Engine Task Queue API
  * ({@link QueueImpl}) and Google Cloud Tasks when the environment variable
@@ -38,7 +54,24 @@ public final class CloudTasksClientWrapper {
     private static final Logger logger = Logger.getLogger(CloudTasksClientWrapper.class.getName());
     private static final String ENV_VAR = "APPENGINE_USE_CLOUDTASK_PUSH_QUEUE";
 
+    private static volatile CloudTasksClient sharedClient;
+
     private CloudTasksClientWrapper() {}
+
+    private static CloudTasksClient getClient() {
+        if (sharedClient == null) {
+            synchronized (CloudTasksClientWrapper.class) {
+                if (sharedClient == null) {
+                    try {
+                        sharedClient = CloudTasksClient.create();
+                    } catch (Exception e) {
+                        throw new RuntimeException("Failed to initialize CloudTasksClient", e);
+                    }
+                }
+            }
+        }
+        return sharedClient;
+    }
 
     /**
      * Checks whether Cloud Tasks push queue routing is enabled via environment variable.
@@ -51,6 +84,7 @@ public final class CloudTasksClientWrapper {
 
     /**
      * Asynchronously enqueues one or more push tasks to Cloud Tasks or records them in Datastore if transactional.
+     * Executes single and batch task creations concurrently in parallel over gRPC streams.
      *
      * @param queueName the short name of the target App Engine queue
      * @param txn the active Datastore transaction, or {@code null} for non-transactional enqueue
@@ -61,39 +95,25 @@ public final class CloudTasksClientWrapper {
         String effectiveQueue = (queueName == null || queueName.isEmpty()) ? "default" : queueName;
         String projectId = TaskProcessor.getProjectId();
         String location = TaskProcessor.getLocation();
-        String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + effectiveQueue;
 
-        List<TaskHandle> createdHandles = new ArrayList<>();
-        List<Entity> transactionalEntities = new ArrayList<>();
-        List<String> transactionalTaskJsons = new ArrayList<>();
-        List<String> transactionalTaskNames = new ArrayList<>();
+        String serviceName = System.getenv("GAE_SERVICE");
+        if (serviceName == null || serviceName.isEmpty()) {
+            serviceName = "taskqueue-java-cloudtask-service";
+        }
 
-        TaskAlreadyExistsException taee = null;
+        if (txn != null) {
+            List<TaskHandle> createdHandles = new ArrayList<>();
+            List<Entity> transactionalEntities = new ArrayList<>();
+            QueueName parent = QueueName.of(projectId, location, effectiveQueue);
 
-        for (TaskOptions options : taskOptionsList) {
-            String taskName = options.getTaskName();
-            if (taskName == null || taskName.isEmpty()) {
-                taskName = "task-" + java.util.UUID.randomUUID().toString();
-            }
+            for (TaskOptions options : taskOptionsList) {
+                String userTaskName = options.getTaskName();
+                String pendingName = (userTaskName != null && !userTaskName.isEmpty()) ? userTaskName : "task-" + java.util.UUID.randomUUID();
+                String jsonPayload = buildTaskJson(parent.toString(), pendingName, options);
 
-            String jsonPayload = buildTaskJson(fullQueueName, taskName, options);
-
-            long scheduleTimeMs = System.currentTimeMillis();
-            if (options.getEtaMillis() != null) {
-                scheduleTimeMs = options.getEtaMillis();
-            } else if (options.getCountdownMillis() != null) {
-                scheduleTimeMs += options.getCountdownMillis();
-            }
-
-            TaskOptions handleOptions = new TaskOptions(options);
-            handleOptions.taskName(taskName);
-            TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
-            handle.etaUsec(scheduleTimeMs * 1000L);
-
-            if (txn != null) {
                 Entity pendingTask = new Entity("_AE_PendingCloudTask");
                 pendingTask.setProperty("queue_name", effectiveQueue);
-                pendingTask.setProperty("cloud_task_name", taskName);
+                pendingTask.setProperty("cloud_task_name", pendingName);
                 pendingTask.setProperty("cloud_task_payload", jsonPayload);
                 pendingTask.setProperty("created", new java.util.Date());
                 pendingTask.setProperty("status", "PENDING");
@@ -103,31 +123,21 @@ public final class CloudTasksClientWrapper {
                 pendingTask.setProperty("handled_by_sweeper", false);
                 pendingTask.setProperty("sdk_lang", "JAVA");
                 transactionalEntities.add(pendingTask);
-                transactionalTaskJsons.add(jsonPayload);
-                transactionalTaskNames.add(taskName);
-                createdHandles.add(handle);
-            } else {
-                ErrorCode code = TaskProcessor.callCloudTasks(effectiveQueue, jsonPayload, System.currentTimeMillis(), taskName);
-                if (code == ErrorCode.OK) {
-                    createdHandles.add(handle);
-                } else if (code == ErrorCode.TASK_ALREADY_EXISTS) {
-                    if (taee == null) {
-                        taee = new TaskAlreadyExistsException("Task already exists: " + taskName);
-                    }
-                    taee.appendTaskName(taskName);
-                } else if (code == ErrorCode.UNKNOWN_QUEUE) {
-                    throw new IllegalStateException("The specified queue is unknown : " + effectiveQueue);
-                } else {
-                    throw new RuntimeException("Failed to enqueue task " + taskName + " to Cloud Tasks");
+
+                long scheduleTimeMs = System.currentTimeMillis();
+                if (options.getEtaMillis() != null) {
+                    scheduleTimeMs = options.getEtaMillis();
+                } else if (options.getCountdownMillis() != null) {
+                    scheduleTimeMs += options.getCountdownMillis();
                 }
+
+                TaskOptions handleOptions = new TaskOptions(options);
+                handleOptions.taskName(pendingName);
+                TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
+                handle.etaUsec(scheduleTimeMs * 1000L);
+                createdHandles.add(handle);
             }
-        }
 
-        if (taee != null) {
-            throw taee;
-        }
-
-        if (txn != null && !transactionalEntities.isEmpty()) {
             DatastoreService ds = DatastoreServiceFactory.getDatastoreService();
             List<com.google.appengine.api.datastore.Key> keys = ds.put(txn, transactionalEntities);
             List<Long> taskIds = new ArrayList<>();
@@ -135,7 +145,6 @@ public final class CloudTasksClientWrapper {
                 taskIds.add(k.getId());
             }
 
-            // Register in RequestCachingFilter for fast-path post-commit dispatch if available
             try {
                 Class<?> filterClass = Class.forName("com.google.appengine.api.taskqueue.RequestCachingFilter");
                 java.lang.reflect.Method addPendingMethod = filterClass.getMethod("addPendingTasks", List.class);
@@ -143,9 +152,317 @@ public final class CloudTasksClientWrapper {
             } catch (Exception e) {
                 logger.log(Level.FINE, "RequestCachingFilter not present or reflective call failed", e);
             }
+
+            return CompletableFuture.completedFuture(createdHandles);
         }
 
-        return CompletableFuture.completedFuture(createdHandles);
+        try {
+            CloudTasksClient client = getClient();
+            QueueName parent = QueueName.of(projectId, location, effectiveQueue);
+            List<CompletableFuture<TaskHandle>> taskFutures = new ArrayList<>();
+
+            for (TaskOptions options : taskOptionsList) {
+                AppEngineHttpRequest.Builder appEngineHttpRequestBuilder = AppEngineHttpRequest.newBuilder()
+                    .setRelativeUri(options.getUrl() != null && !options.getUrl().isEmpty() ? options.getUrl() : "/")
+                    .setAppEngineRouting(AppEngineRouting.newBuilder().setService(serviceName).build());
+
+                byte[] payload = options.getPayload();
+                if (payload != null && payload.length > 0) {
+                    setReflectiveProperty(appEngineHttpRequestBuilder, "setBody", payload);
+                }
+
+                for (Map.Entry<String, List<String>> entry : options.getHeaders().entrySet()) {
+                    for (String val : entry.getValue()) {
+                        appEngineHttpRequestBuilder.putHeaders(entry.getKey(), val);
+                    }
+                }
+
+                RetryOptions retryOpts = options.getRetryOptions();
+                if (retryOpts != null) {
+                    if (retryOpts.getTaskRetryLimit() != null) {
+                        appEngineHttpRequestBuilder.putHeaders("X-Task-Retry-Limit", String.valueOf(retryOpts.getTaskRetryLimit()));
+                    }
+                    if (retryOpts.getTaskAgeLimitSeconds() != null) {
+                        appEngineHttpRequestBuilder.putHeaders("X-Task-Age-Limit-Seconds", String.valueOf(retryOpts.getTaskAgeLimitSeconds()));
+                    }
+                }
+
+                Task.Builder taskBuilder = Task.newBuilder()
+                    .setAppEngineHttpRequest(appEngineHttpRequestBuilder.build());
+
+                String userTaskName = options.getTaskName();
+                if (userTaskName != null && !userTaskName.isEmpty()) {
+                    taskBuilder.setName(TaskName.of(projectId, location, effectiveQueue, userTaskName).toString());
+                }
+
+                long scheduleTimeMs = System.currentTimeMillis();
+                boolean hasDelay = false;
+                if (options.getEtaMillis() != null) {
+                    scheduleTimeMs = options.getEtaMillis();
+                    hasDelay = true;
+                } else if (options.getCountdownMillis() != null) {
+                    scheduleTimeMs += options.getCountdownMillis();
+                    hasDelay = true;
+                }
+                final long finalScheduleTimeMs = scheduleTimeMs;
+                if (hasDelay && scheduleTimeMs > System.currentTimeMillis() + 100L) {
+                    Timestamp ts = Timestamp.newBuilder()
+                        .setSeconds(scheduleTimeMs / 1000L)
+                        .setNanos((int) ((scheduleTimeMs % 1000L) * 1_000_000))
+                        .build();
+                    setReflectiveProperty(taskBuilder, "setScheduleTime", ts);
+                }
+
+                CreateTaskRequest req = CreateTaskRequest.newBuilder()
+                    .setParent(parent.toString())
+                    .setTask(taskBuilder.build())
+                    .build();
+
+                CompletableFuture<TaskHandle> cf = new CompletableFuture<>();
+                ApiFuture<Task> apiFuture = client.createTaskCallable().futureCall(req);
+                ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Task>() {
+                    @Override
+                    public void onSuccess(Task createdTask) {
+                        String chosenTaskName = TaskName.parse(createdTask.getName()).getTask();
+                        TaskOptions handleOptions = new TaskOptions(options);
+                        handleOptions.taskName(chosenTaskName);
+                        TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
+                        handle.etaUsec(finalScheduleTimeMs * 1000L);
+                        cf.complete(handle);
+                    }
+
+                    @Override
+                    public void onFailure(Throwable t) {
+                        String nameForErr = (userTaskName != null && !userTaskName.isEmpty()) ? userTaskName : "unknown";
+                        if (isAlreadyExists(t)) {
+                            cf.completeExceptionally(new TaskAlreadyExistsException("Task already exists: " + nameForErr));
+                        } else if (isUnknownQueue(t)) {
+                            cf.completeExceptionally(new IllegalStateException("The specified queue is unknown : " + effectiveQueue, t));
+                        } else {
+                            cf.completeExceptionally(new RuntimeException("Failed to enqueue task to Cloud Tasks via Client SDK: " + t.getMessage(), t));
+                        }
+                    }
+                }, MoreExecutors.directExecutor());
+                taskFutures.add(cf);
+            }
+
+            List<TaskHandle> createdHandles = new ArrayList<>();
+            TaskAlreadyExistsException taee = null;
+            for (CompletableFuture<TaskHandle> cf : taskFutures) {
+                try {
+                    createdHandles.add(cf.join());
+                } catch (java.util.concurrent.CompletionException ce) {
+                    Throwable cause = ce.getCause();
+                    if (cause instanceof TaskAlreadyExistsException) {
+                        if (taee == null) taee = (TaskAlreadyExistsException) cause;
+                        else taee.appendTaskName(cause.getMessage());
+                    } else if (cause instanceof RuntimeException) {
+                        throw (RuntimeException) cause;
+                    } else {
+                        throw new RuntimeException(cause);
+                    }
+                }
+            }
+            if (taee != null) throw taee;
+            return CompletableFuture.completedFuture(createdHandles);
+        } catch (Exception e) {
+            if (e instanceof RuntimeException) throw (RuntimeException) e;
+            throw new RuntimeException("Failed to initialize CloudTasksClient", e);
+        }
+    }
+
+    /**
+     * Asynchronously deletes one or more tasks from Cloud Tasks by task handle concurrently in parallel
+     * using official Client SDK.
+     *
+     * @param queueName the short name of the target App Engine queue
+     * @param taskHandles the list of task handles to delete
+     * @return a {@link Future} resolving to a list of booleans indicating deletion success
+     */
+    public static Future<List<Boolean>> deleteTaskAsync(String queueName, List<TaskHandle> taskHandles) {
+        String effectiveQueue = (queueName == null || queueName.isEmpty()) ? "default" : queueName;
+        String projectId = TaskProcessor.getProjectId();
+        String location = TaskProcessor.getLocation();
+
+        try {
+            CloudTasksClient client = getClient();
+            List<CompletableFuture<Boolean>> futures = new ArrayList<>();
+            for (TaskHandle handle : taskHandles) {
+                TaskName taskName = TaskName.of(projectId, location, effectiveQueue, handle.getName());
+                DeleteTaskRequest req = DeleteTaskRequest.newBuilder().setName(taskName.toString()).build();
+
+                CompletableFuture<Boolean> cf = new CompletableFuture<>();
+                ApiFuture<?> apiFuture = client.deleteTaskCallable().futureCall(req);
+                ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Object>() {
+                    @Override
+                    public void onSuccess(Object result) {
+                        cf.complete(Boolean.TRUE);
+                    }
+
+                    @Override
+                    public void onFailure(Throwable t) {
+                        logger.log(Level.WARNING, "Failed to delete Cloud Task via Client SDK: " + taskName, t);
+                        cf.complete(Boolean.FALSE);
+                    }
+                }, MoreExecutors.directExecutor());
+                futures.add(cf);
+            }
+
+            List<Boolean> results = new ArrayList<>();
+            for (CompletableFuture<Boolean> cf : futures) {
+                results.add(cf.join());
+            }
+            return CompletableFuture.completedFuture(results);
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Failed to initialize CloudTasksClient for delete", e);
+            List<Boolean> results = new ArrayList<>();
+            for (int i = 0; i < taskHandles.size(); i++) results.add(Boolean.FALSE);
+            return CompletableFuture.completedFuture(results);
+        }
+    }
+
+    /**
+     * Asynchronously fetches statistics for the specified queue from Cloud Tasks using official Client SDK.
+     *
+     * @param queueName the short name of the queue to fetch statistics for
+     * @return a {@link Future} resolving to the {@link QueueStatistics}
+     */
+    public static Future<QueueStatistics> fetchStatisticsAsync(String queueName) {
+        String effectiveQueue = (queueName == null || queueName.isEmpty()) ? "default" : queueName;
+        String projectId = TaskProcessor.getProjectId();
+        String location = TaskProcessor.getLocation();
+
+        try {
+            CloudTasksClient client = getClient();
+            GetQueueRequest request = GetQueueRequest.newBuilder()
+                .setName(QueueName.of(projectId, location, effectiveQueue).toString())
+                .setReadMask(FieldMask.newBuilder().addPaths("stats").build())
+                .build();
+
+            Queue queue = client.getQueue(request);
+            QueueStats stats = queue.getStats();
+
+            int tasksCount = (int) stats.getTasksCount();
+            long oldestEtaUsec = 0;
+            if (stats.hasOldestEstimatedArrivalTime()) {
+                Timestamp oldest = stats.getOldestEstimatedArrivalTime();
+                oldestEtaUsec = oldest.getSeconds() * 1_000_000L + oldest.getNanos() / 1000L;
+            }
+            int executedLastMinute = (int) stats.getExecutedLastMinuteCount();
+            int requestsInFlight = (int) stats.getConcurrentDispatchesCount();
+            double enforcedRate = stats.getEffectiveExecutionRate();
+
+            TaskQueueFetchQueueStatsResponse.QueueStats.Builder legacyStatsBuilder =
+                TaskQueueFetchQueueStatsResponse.QueueStats.newBuilder();
+            legacyStatsBuilder.setNumTasks(tasksCount);
+            legacyStatsBuilder.setOldestEtaUsec(oldestEtaUsec);
+
+            TaskQueueScannerQueueInfo.Builder scannerInfoBuilder = TaskQueueScannerQueueInfo.newBuilder();
+            scannerInfoBuilder.setExecutedLastMinute(executedLastMinute);
+            scannerInfoBuilder.setExecutedLastHour(0);
+            scannerInfoBuilder.setRequestsInFlight(requestsInFlight);
+            scannerInfoBuilder.setEnforcedRate(enforcedRate);
+            scannerInfoBuilder.setSamplingDurationSeconds(60.0);
+            legacyStatsBuilder.setScannerInfo(scannerInfoBuilder);
+
+            QueueStatistics queueStats = new QueueStatistics(effectiveQueue, legacyStatsBuilder.build());
+            return CompletableFuture.completedFuture(queueStats);
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "CLOUDTASK: Failed to fetch stats for queue " + effectiveQueue + " via Client SDK: " + e.getMessage(), e);
+            throw new RuntimeException("CLOUDTASK_STATS_FAILED", e);
+        }
+    }
+
+    /**
+     * Purges all tasks from the specified Cloud Tasks queue using official Client SDK.
+     *
+     * @param queueName the short name of the target queue
+     */
+    public static void purge(String queueName) {
+        String effectiveQueue = (queueName == null || queueName.isEmpty()) ? "default" : queueName;
+        String projectId = TaskProcessor.getProjectId();
+        String location = TaskProcessor.getLocation();
+        QueueName parent = QueueName.of(projectId, location, effectiveQueue);
+
+        try {
+            CloudTasksClient client = getClient();
+            client.purgeQueue(parent);
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "CLOUDTASK: Failed to purge queue " + effectiveQueue + " via Client SDK: " + e.getMessage(), e);
+            throw new RuntimeException("CLOUDTASK_PURGE_FAILED", e);
+        }
+    }
+
+    private static void setReflectiveProperty(Object builder, String methodName, Object value) {
+        try {
+            java.lang.reflect.Method targetMethod = null;
+            for (java.lang.reflect.Method m : builder.getClass().getMethods()) {
+                if (methodName.equals(m.getName()) && m.getParameterCount() == 1) {
+                    Class<?> pt = m.getParameterTypes()[0];
+                    if (!pt.getName().endsWith("$Builder") && !pt.getName().endsWith(".Builder")) {
+                        targetMethod = m;
+                        targetMethod.setAccessible(true);
+                        break;
+                    }
+                }
+            }
+            if (targetMethod != null) {
+                Class<?> paramType = targetMethod.getParameterTypes()[0];
+                Object convertedValue = value;
+                if (value instanceof byte[]) {
+                    java.lang.reflect.Method copyFromMethod = paramType.getMethod("copyFrom", byte[].class);
+                    copyFromMethod.setAccessible(true);
+                    convertedValue = copyFromMethod.invoke(null, (Object) value);
+                } else if (value instanceof com.google.protobuf.MessageLite) {
+                    byte[] bytes = ((com.google.protobuf.MessageLite) value).toByteArray();
+                    java.lang.reflect.Method parseFromMethod = paramType.getMethod("parseFrom", byte[].class);
+                    parseFromMethod.setAccessible(true);
+                    convertedValue = parseFromMethod.invoke(null, (Object) bytes);
+                }
+                targetMethod.invoke(builder, convertedValue);
+            } else {
+                throw new RuntimeException("Method not found on builder: " + methodName);
+            }
+        } catch (Exception e) {
+            Throwable cause = (e instanceof java.lang.reflect.InvocationTargetException) ? ((java.lang.reflect.InvocationTargetException) e).getTargetException() : e;
+            logger.log(Level.SEVERE, "Failed reflective call " + methodName + " on " + builder.getClass().getName(), cause);
+            throw new RuntimeException("Reflective property set failed for " + methodName + ": " + cause, cause);
+        }
+    }
+
+    private static boolean isAlreadyExists(Throwable t) {
+        Throwable curr = t;
+        while (curr != null) {
+            if (curr instanceof AlreadyExistsException) return true;
+            if (curr instanceof ApiException &&
+                ((ApiException) curr).getStatusCode().getCode() == StatusCode.Code.ALREADY_EXISTS) return true;
+            String clsName = curr.getClass().getName();
+            String msg = curr.getMessage();
+            if (clsName.contains("AlreadyExists") || (msg != null && (msg.contains("ALREADY_EXISTS") || msg.contains("existed too recently")))) {
+                return true;
+            }
+            curr = curr.getCause();
+        }
+        return false;
+    }
+
+    private static boolean isUnknownQueue(Throwable t) {
+        Throwable curr = t;
+        while (curr != null) {
+            if (curr instanceof NotFoundException || curr instanceof InvalidArgumentException || curr instanceof FailedPreconditionException) return true;
+            if (curr instanceof ApiException) {
+                StatusCode.Code code = ((ApiException) curr).getStatusCode().getCode();
+                if (code == StatusCode.Code.NOT_FOUND || code == StatusCode.Code.FAILED_PRECONDITION || code == StatusCode.Code.INVALID_ARGUMENT) return true;
+            }
+            String clsName = curr.getClass().getName();
+            String msg = curr.getMessage();
+            if (clsName.contains("NotFound") || clsName.contains("InvalidArgument") || clsName.contains("FailedPrecondition") ||
+                (msg != null && (msg.contains("Queue does not exist") || msg.contains("NOT_FOUND") || msg.contains("FAILED_PRECONDITION")))) {
+                return true;
+            }
+            curr = curr.getCause();
+        }
+        return false;
     }
 
     private static String buildTaskJson(String fullQueueName, String taskName, TaskOptions options) {
@@ -203,159 +520,6 @@ public final class CloudTasksClientWrapper {
         
         jsonBuilder.append("}}");
         return jsonBuilder.toString();
-    }
-
-    /**
-     * Asynchronously deletes one or more tasks from Cloud Tasks by task handle.
-     *
-     * @param queueName the short name of the target App Engine queue
-     * @param taskHandles the list of task handles to delete
-     * @return a {@link Future} resolving to a list of booleans indicating deletion success
-     */
-    public static Future<List<Boolean>> deleteTaskAsync(String queueName, List<TaskHandle> taskHandles) {
-        String effectiveQueue = (queueName == null || queueName.isEmpty()) ? "default" : queueName;
-        String projectId = TaskProcessor.getProjectId();
-        String location = TaskProcessor.getLocation();
-        String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + effectiveQueue;
-
-        List<Boolean> results = new ArrayList<>();
-        for (TaskHandle handle : taskHandles) {
-            String fullTaskName = fullQueueName + "/tasks/" + handle.getName();
-            try {
-                TaskProcessor.deleteCloudTask(fullTaskName);
-                results.add(Boolean.TRUE);
-            } catch (Exception e) {
-                logger.log(Level.WARNING, "Failed to delete Cloud Task: " + fullTaskName, e);
-                results.add(Boolean.FALSE);
-            }
-        }
-        return CompletableFuture.completedFuture(results);
-    }
-
-    /**
-     * Asynchronously fetches statistics for the specified queue from Cloud Tasks.
-     *
-     * @param queueName the short name of the queue to fetch statistics for
-     * @return a {@link Future} resolving to the {@link QueueStatistics}
-     */
-    public static Future<QueueStatistics> fetchStatisticsAsync(String queueName) {
-        String effectiveQueue = (queueName == null || queueName.isEmpty()) ? "default" : queueName;
-        String projectId = TaskProcessor.getProjectId();
-        String location = TaskProcessor.getLocation();
-        String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + effectiveQueue;
-
-        try {
-            AppIdentityService appIdentityService = AppIdentityServiceFactory.getAppIdentityService();
-            AppIdentityService.GetAccessTokenResult tokenResult = appIdentityService.getAccessToken(
-                Collections.singletonList("https://www.googleapis.com/auth/cloud-platform")
-            );
-            String token = tokenResult.getAccessToken();
-
-            String urlStr = "https://cloudtasks.googleapis.com/v2beta3/" + fullQueueName + "?readMask=stats";
-            URL url = new URL(urlStr);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("GET");
-            conn.setRequestProperty("Authorization", "Bearer " + token);
-
-            int responseCode = conn.getResponseCode();
-            if (responseCode == 200) {
-                BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                String inputLine;
-                StringBuilder responseContent = new StringBuilder();
-                while ((inputLine = in.readLine()) != null) {
-                    responseContent.append(inputLine);
-                }
-                in.close();
-
-                String json = responseContent.toString();
-                int tasksCount = 0;
-                long oldestEtaUsec = 0;
-                int executedLastMinute = 0;
-                int requestsInFlight = 0;
-                double enforcedRate = 0.0;
-
-                Pattern p = Pattern.compile("\"tasksCount\":\\s*\"(\\d+)\"");
-                Matcher m = p.matcher(json);
-                if (m.find()) tasksCount = Integer.parseInt(m.group(1));
-
-                p = Pattern.compile("\"oldestEstimatedArrivalTime\":\\s*\"([^\"]+)\"");
-                m = p.matcher(json);
-                if (m.find()) {
-                    Instant instant = Instant.parse(m.group(1));
-                    oldestEtaUsec = instant.getEpochSecond() * 1000000L + instant.getNano() / 1000L;
-                }
-
-                p = Pattern.compile("\"executedLastMinuteCount\":\\s*\"(\\d+)\"");
-                m = p.matcher(json);
-                if (m.find()) executedLastMinute = Integer.parseInt(m.group(1));
-
-                p = Pattern.compile("\"concurrentDispatchesCount\":\\s*\"(\\d+)\"");
-                m = p.matcher(json);
-                if (m.find()) requestsInFlight = Integer.parseInt(m.group(1));
-
-                p = Pattern.compile("\"effectiveExecutionRate\":\\s*(\\d+(\\.\\d+)?)");
-                m = p.matcher(json);
-                if (m.find()) enforcedRate = Double.parseDouble(m.group(1));
-
-                TaskQueueFetchQueueStatsResponse.QueueStats.Builder legacyStatsBuilder =
-                    TaskQueueFetchQueueStatsResponse.QueueStats.newBuilder();
-                legacyStatsBuilder.setNumTasks(tasksCount);
-                legacyStatsBuilder.setOldestEtaUsec(oldestEtaUsec);
-
-                TaskQueueScannerQueueInfo.Builder scannerInfoBuilder = TaskQueueScannerQueueInfo.newBuilder();
-                scannerInfoBuilder.setExecutedLastMinute(executedLastMinute);
-                scannerInfoBuilder.setExecutedLastHour(0);
-                scannerInfoBuilder.setRequestsInFlight(requestsInFlight);
-                scannerInfoBuilder.setEnforcedRate(enforcedRate);
-                scannerInfoBuilder.setSamplingDurationSeconds(60.0);
-                legacyStatsBuilder.setScannerInfo(scannerInfoBuilder);
-
-                QueueStatistics stats = new QueueStatistics(effectiveQueue, legacyStatsBuilder.build());
-                return CompletableFuture.completedFuture(stats);
-            } else {
-                throw new RuntimeException("CLOUDTASK: REST API failed with code " + responseCode);
-            }
-        } catch (Exception e) {
-            logger.log(Level.SEVERE, "CLOUDTASK: Failed to fetch stats for queue " + effectiveQueue + ": " + e.getMessage(), e);
-            throw new RuntimeException("CLOUDTASK_STATS_FAILED", e);
-        }
-    }
-
-    /**
-     * Purges all tasks from the specified Cloud Tasks queue.
-     *
-     * @param queueName the short name of the target queue
-     */
-    public static void purge(String queueName) {
-        String effectiveQueue = (queueName == null || queueName.isEmpty()) ? "default" : queueName;
-        String projectId = TaskProcessor.getProjectId();
-        String location = TaskProcessor.getLocation();
-        String fullQueueName = "projects/" + projectId + "/locations/" + location + "/queues/" + effectiveQueue;
-
-        try {
-            AppIdentityService appIdentityService = AppIdentityServiceFactory.getAppIdentityService();
-            AppIdentityService.GetAccessTokenResult tokenResult = appIdentityService.getAccessToken(
-                Collections.singletonList("https://www.googleapis.com/auth/cloud-platform")
-            );
-            String token = tokenResult.getAccessToken();
-
-            String urlStr = "https://cloudtasks.googleapis.com/v2beta3/" + fullQueueName + ":purge";
-            URL url = new URL(urlStr);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Authorization", "Bearer " + token);
-            conn.setRequestProperty("Content-Type", "application/json");
-            conn.setDoOutput(true);
-            conn.getOutputStream().write("{}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
-
-            int responseCode = conn.getResponseCode();
-            if (responseCode != 200) {
-                throw new RuntimeException("CLOUDTASK: Purge queue failed with HTTP " + responseCode);
-            }
-        } catch (Exception e) {
-            logger.log(Level.SEVERE, "CLOUDTASK: Failed to purge queue " + effectiveQueue + ": " + e.getMessage(), e);
-            throw new RuntimeException("CLOUDTASK_PURGE_FAILED", e);
-        }
     }
 
     private static String escapeJson(String input) {

@@ -142,6 +142,14 @@ public class TaskProcessor {
      * @return the GCP region ID (e.g. {@code "us-central1"}, {@code "us-east1"})
      */
     public static String getLocation() {
+        String zone = System.getenv("GAE_ZONE");
+        if (zone != null && !zone.isEmpty()) {
+            int lastDash = zone.lastIndexOf('-');
+            if (lastDash > 0) {
+                return zone.substring(0, lastDash);
+            }
+            return zone;
+        }
         String location = System.getenv("LOCATION_ID");
         if (location != null && !location.isEmpty()) {
             return location;
