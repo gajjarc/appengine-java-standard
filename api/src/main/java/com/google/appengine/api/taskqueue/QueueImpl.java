@@ -752,7 +752,14 @@ class QueueImpl implements Queue {
   /** See {@link Queue#deleteTaskAsync(List<TaskHandle>)}. */
   @Override
   public Future<List<Boolean>> deleteTaskAsync(List<TaskHandle> taskHandles) {
-    if (isCloudTaskBackendEnabled()) {
+    boolean hasPullTask = false;
+    for (TaskHandle handle : taskHandles) {
+      if (handle.getMethod() == TaskOptions.Method.PULL) {
+        hasPullTask = true;
+        break;
+      }
+    }
+    if (!hasPullTask && isCloudTaskBackendEnabled()) {
       return CloudTasksClientWrapper.deleteTaskAsync(queueName, taskHandles);
     }
     final TaskQueueDeleteRequest.Builder deleteRequest =
