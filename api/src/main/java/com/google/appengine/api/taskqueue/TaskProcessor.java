@@ -52,16 +52,18 @@ public class TaskProcessor {
                         com.google.appengine.api.appidentity.AppIdentityService appIdentityService =
                             com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
                         com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
-                            appIdentityService.getAccessToken(Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
-                        com.google.auth.oauth2.GoogleCredentials credentials =
+                            appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
+                        com.google.auth.oauth2.AccessToken accessToken =
                             com.google.auth.oauth2.AccessToken.newBuilder()
                                 .setTokenValue(tokenResult.getAccessToken())
                                 .setExpirationTime(tokenResult.getExpirationTime())
-                                .build()
-                                .toCredentials();
-                        CloudTasksSettings settings = CloudTasksSettings.newBuilder()
-                            .setCredentialsProvider(com.google.api.gax.core.FixedCredentialsProvider.create(credentials))
-                            .build();
+                                .build();
+                        com.google.auth.oauth2.GoogleCredentials credentials =
+                            com.google.auth.oauth2.GoogleCredentials.create(accessToken);
+                        com.google.cloud.tasks.v2beta3.CloudTasksSettings settings =
+                            com.google.cloud.tasks.v2beta3.CloudTasksSettings.newBuilder()
+                                .setCredentialsProvider(com.google.api.gax.core.FixedCredentialsProvider.create(credentials))
+                                .build();
                         sharedClient = CloudTasksClient.create(settings);
                     } catch (Exception e) {
                         throw new RuntimeException("Failed to initialize CloudTasksClient in TaskProcessor", e);
