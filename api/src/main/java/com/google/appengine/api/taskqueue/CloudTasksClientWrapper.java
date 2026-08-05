@@ -19,6 +19,7 @@ import com.google.cloud.tasks.v2beta3.QueueName;
 import com.google.cloud.tasks.v2beta3.QueueStats;
 import com.google.cloud.tasks.v2beta3.Task;
 import com.google.cloud.tasks.v2beta3.TaskName;
+import com.google.protobuf.ByteString;
 import com.google.protobuf.FieldMask;
 import com.google.protobuf.Timestamp;
 
@@ -236,7 +237,7 @@ public final class CloudTasksClientWrapper {
                 .setSeconds(scheduleTimeMs / 1000L)
                 .setNanos((int) ((scheduleTimeMs % 1000L) * 1_000_000))
                 .build();
-            setReflectiveProperty(taskBuilder, "setScheduleTime", ts);
+            taskBuilder.setScheduleTime(ts);
         }
 
         return CreateTaskRequest.newBuilder()
@@ -252,7 +253,7 @@ public final class CloudTasksClientWrapper {
 
         byte[] payload = options.getPayload();
         if (payload != null && payload.length > 0) {
-            setReflectiveProperty(builder, "setBody", payload);
+            builder.setBody(ByteString.copyFrom(payload));
         }
 
         for (Map.Entry<String, List<String>> entry : options.getHeaders().entrySet()) {
@@ -444,43 +445,6 @@ public final class CloudTasksClientWrapper {
         } catch (Exception e) {
             logger.log(Level.SEVERE, "CLOUDTASK: Failed to purge queue " + effectiveQueue + " via Client SDK: " + e.getMessage(), e);
             throw new RuntimeException("CLOUDTASK_PURGE_FAILED", e);
-        }
-    }
-
-    private static void setReflectiveProperty(Object builder, String methodName, Object value) {
-        try {
-            java.lang.reflect.Method targetMethod = null;
-            for (java.lang.reflect.Method m : builder.getClass().getMethods()) {
-                if (methodName.equals(m.getName()) && m.getParameterCount() == 1) {
-                    Class<?> pt = m.getParameterTypes()[0];
-                    if (!pt.getName().endsWith("$Builder") && !pt.getName().endsWith(".Builder")) {
-                        targetMethod = m;
-                        targetMethod.setAccessible(true);
-                        break;
-                    }
-                }
-            }
-            if (targetMethod != null) {
-                Class<?> paramType = targetMethod.getParameterTypes()[0];
-                Object convertedValue = value;
-                if (value instanceof byte[]) {
-                    java.lang.reflect.Method copyFromMethod = paramType.getMethod("copyFrom", byte[].class);
-                    copyFromMethod.setAccessible(true);
-                    convertedValue = copyFromMethod.invoke(null, (Object) value);
-                } else if (value instanceof com.google.protobuf.MessageLite) {
-                    byte[] bytes = ((com.google.protobuf.MessageLite) value).toByteArray();
-                    java.lang.reflect.Method parseFromMethod = paramType.getMethod("parseFrom", byte[].class);
-                    parseFromMethod.setAccessible(true);
-                    convertedValue = parseFromMethod.invoke(null, (Object) bytes);
-                }
-                targetMethod.invoke(builder, convertedValue);
-            } else {
-                throw new RuntimeException("Method not found on builder: " + methodName);
-            }
-        } catch (Exception e) {
-            Throwable cause = (e instanceof java.lang.reflect.InvocationTargetException) ? ((java.lang.reflect.InvocationTargetException) e).getTargetException() : e;
-            logger.log(Level.SEVERE, "Failed reflective call " + methodName + " on " + builder.getClass().getName(), cause);
-            throw new RuntimeException("Reflective property set failed for " + methodName + ": " + cause, cause);
         }
     }
 
