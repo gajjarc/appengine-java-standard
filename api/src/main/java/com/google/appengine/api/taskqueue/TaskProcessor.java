@@ -7,72 +7,20 @@ import com.google.appengine.api.datastore.Key;
 import com.google.appengine.api.datastore.KeyFactory;
 import com.google.appengine.api.datastore.Transaction;
 import com.google.apphosting.api.ApiProxy;
-import com.google.cloud.tasks.v2beta3.AppEngineHttpRequest;
-import com.google.cloud.tasks.v2beta3.AppEngineRouting;
-import com.google.cloud.tasks.v2beta3.CloudTasksClient;
-import com.google.cloud.tasks.v2beta3.CloudTasksSettings;
-import com.google.cloud.tasks.v2beta3.CreateTaskRequest;
-import com.google.cloud.tasks.v2beta3.QueueName;
-import com.google.cloud.tasks.v2beta3.Task;
-import com.google.cloud.tasks.v2beta3.TaskName;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import com.google.protobuf.ByteString;
-import com.google.protobuf.Timestamp;
 
-import java.util.Base64;
-import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
  * Processor utility responsible for executing and dispatching pending Cloud Tasks stored in Datastore
- * ({@code _AE_PendingCloudTask}) to Google Cloud Tasks using the official Client SDK.
+ * ({@code _AE_PendingCloudTask}) to Google Cloud Tasks using the official Client SDK wrapper.
  *
  * <p>Handles task state transitions ({@code PENDING}, {@code PROCESSING}, {@code DONE}, {@code FAILED}),
- * exponential backoff retry tracking, GCP project and region discovery, and Client SDK task creation.
+ * exponential backoff retry tracking, GCP project and region discovery, and task dispatching via {@link CloudTasksClientWrapper}.
  */
 public class TaskProcessor {
     private static final Logger logger = Logger.getLogger(TaskProcessor.class.getName());
-
-    static {
-        System.setProperty("com.google.cloud.mtls.enabled", "false");
-    }
-
-    private static volatile CloudTasksClient sharedClient;
-
-    private static CloudTasksClient getClient() {
-        if (sharedClient == null) {
-            synchronized (TaskProcessor.class) {
-                if (sharedClient == null) {
-                    try {
-                        com.google.appengine.api.appidentity.AppIdentityService appIdentityService =
-                            com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
-                        com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
-                            appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
-                        com.google.auth.oauth2.AccessToken accessToken =
-                            com.google.auth.oauth2.AccessToken.newBuilder()
-                                .setTokenValue(tokenResult.getAccessToken())
-                                .setExpirationTime(tokenResult.getExpirationTime())
-                                .build();
-                        com.google.auth.oauth2.GoogleCredentials credentials =
-                            com.google.auth.oauth2.GoogleCredentials.create(accessToken);
-                        com.google.cloud.tasks.v2beta3.CloudTasksSettings settings =
-                            com.google.cloud.tasks.v2beta3.CloudTasksSettings.newBuilder()
-                                .setCredentialsProvider(com.google.api.gax.core.FixedCredentialsProvider.create(credentials))
-                                .build();
-                        sharedClient = CloudTasksClient.create(settings);
-                    } catch (Exception e) {
-                        throw new RuntimeException("Failed to initialize CloudTasksClient in TaskProcessor", e);
-                    }
-                }
-            }
-        }
-        return sharedClient;
-    }
 
     /**
      * Processes a list of pending task entity IDs stored in Datastore.
@@ -240,7 +188,7 @@ public class TaskProcessor {
     }
 
     /**
-     * Dispatches a single push task using the official Google Cloud Tasks Client SDK.
+     * Dispatches a single push task using {@link CloudTasksClientWrapper}.
      *
      * @param queueName the target task queue name
      * @param payload the JSON task payload stored in Datastore
@@ -251,75 +199,6 @@ public class TaskProcessor {
      */
     public static com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode callCloudTasksViaSdk(
             String queueName, String payload, long entityId, String taskName) {
-        String projectId = getProjectId();
-        String location = getLocation();
-        QueueName parent = QueueName.of(projectId, location, queueName);
-        if (taskName == null || taskName.isEmpty()) {
-            taskName = "task-" + entityId;
-        }
-        String fullTaskName = TaskName.of(projectId, location, queueName, taskName).toString();
-
-        try {
-            CloudTasksClient client = getClient();
-            JsonObject json = new JsonParser().parse(payload).getAsJsonObject();
-            JsonObject taskJson = json.getAsJsonObject("task");
-
-            AppEngineHttpRequest.Builder appEngineHttpRequestBuilder = AppEngineHttpRequest.newBuilder();
-            if (taskJson != null && taskJson.has("appEngineHttpRequest")) {
-                JsonObject httpJson = taskJson.getAsJsonObject("appEngineHttpRequest");
-                if (httpJson.has("relativeUri")) {
-                    appEngineHttpRequestBuilder.setRelativeUri(httpJson.get("relativeUri").getAsString());
-                }
-                if (httpJson.has("body")) {
-                    byte[] bodyBytes = Base64.getDecoder().decode(httpJson.get("body").getAsString());
-                    appEngineHttpRequestBuilder.setBody(ByteString.copyFrom(bodyBytes));
-                }
-                if (httpJson.has("appEngineRouting")) {
-                    JsonObject routingJson = httpJson.getAsJsonObject("appEngineRouting");
-                    AppEngineRouting.Builder routingBuilder = AppEngineRouting.newBuilder();
-                    if (routingJson.has("service")) {
-                        routingBuilder.setService(routingJson.get("service").getAsString());
-                    }
-                    appEngineHttpRequestBuilder.setAppEngineRouting(routingBuilder.build());
-                }
-                if (httpJson.has("headers")) {
-                    JsonObject headersJson = httpJson.getAsJsonObject("headers");
-                    for (Map.Entry<String, JsonElement> entry : headersJson.entrySet()) {
-                        appEngineHttpRequestBuilder.putHeaders(entry.getKey(), entry.getValue().getAsString());
-                    }
-                }
-            }
-
-            Task.Builder taskBuilder = Task.newBuilder()
-                .setName(fullTaskName)
-                .setAppEngineHttpRequest(appEngineHttpRequestBuilder.build());
-
-            if (taskJson != null && taskJson.has("scheduleTime")) {
-                String isoTime = taskJson.get("scheduleTime").getAsString();
-                java.time.Instant instant = java.time.Instant.parse(isoTime);
-                Timestamp ts = Timestamp.newBuilder()
-                    .setSeconds(instant.getEpochSecond())
-                    .setNanos(instant.getNano())
-                    .build();
-                taskBuilder.setScheduleTime(ts);
-            }
-
-            CreateTaskRequest request = CreateTaskRequest.newBuilder()
-                .setParent(parent.toString())
-                .setTask(taskBuilder.build())
-                .build();
-
-            client.createTask(request);
-            return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.OK;
-        } catch (com.google.api.gax.rpc.AlreadyExistsException e) {
-            logger.info("CLOUDTASK: Task already exists (idempotency): " + taskName);
-            return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
-        } catch (com.google.api.gax.rpc.NotFoundException e) {
-            logger.warning("CLOUDTASK: Queue not found: " + queueName);
-            return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE;
-        } catch (Exception e) {
-            logger.log(Level.SEVERE, "CLOUDTASK: Client SDK exception dispatching task " + taskName + ": " + e.getMessage(), e);
-            return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.INTERNAL_ERROR;
-        }
+        return CloudTasksClientWrapper.dispatchPendingTask(queueName, payload, entityId, taskName);
     }
 }

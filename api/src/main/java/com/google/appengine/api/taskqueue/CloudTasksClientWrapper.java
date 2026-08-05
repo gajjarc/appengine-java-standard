@@ -559,4 +559,88 @@ public final class CloudTasksClientWrapper {
                     .replace("\r", "\\r")
                     .replace("\t", "\\t");
     }
+
+    /**
+     * Dispatches a single pending push task stored in Datastore to Google Cloud Tasks via official Client SDK.
+     * Encapsulates Client SDK creation, payload mapping, and GAX exception translation for {@link TaskProcessor}.
+     *
+     * @param queueName the target task queue name
+     * @param payload the JSON task payload stored in Datastore
+     * @param entityId the Datastore entity ID for fallback task naming
+     * @param taskName the chosen task name or {@code null}
+     * @return a {@link com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode}
+     */
+    public static com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode dispatchPendingTask(
+            String queueName, String payload, long entityId, String taskName) {
+        String projectId = TaskProcessor.getProjectId();
+        String location = TaskProcessor.getLocation();
+        QueueName parent = QueueName.of(projectId, location, queueName);
+        if (taskName == null || taskName.isEmpty()) {
+            taskName = "task-" + entityId;
+        }
+        String fullTaskName = TaskName.of(projectId, location, queueName, taskName).toString();
+
+        try {
+            CloudTasksClient client = getClient();
+            com.google.gson.JsonObject json = new com.google.gson.JsonParser().parse(payload).getAsJsonObject();
+            com.google.gson.JsonObject taskJson = json.getAsJsonObject("task");
+
+            AppEngineHttpRequest.Builder appEngineHttpRequestBuilder = AppEngineHttpRequest.newBuilder();
+            if (taskJson != null && taskJson.has("appEngineHttpRequest")) {
+                com.google.gson.JsonObject httpJson = taskJson.getAsJsonObject("appEngineHttpRequest");
+                if (httpJson.has("relativeUri")) {
+                    appEngineHttpRequestBuilder.setRelativeUri(httpJson.get("relativeUri").getAsString());
+                }
+                if (httpJson.has("body")) {
+                    byte[] bodyBytes = java.util.Base64.getDecoder().decode(httpJson.get("body").getAsString());
+                    appEngineHttpRequestBuilder.setBody(ByteString.copyFrom(bodyBytes));
+                }
+                if (httpJson.has("appEngineRouting")) {
+                    com.google.gson.JsonObject routingJson = httpJson.getAsJsonObject("appEngineRouting");
+                    AppEngineRouting.Builder routingBuilder = AppEngineRouting.newBuilder();
+                    if (routingJson.has("service")) {
+                        routingBuilder.setService(routingJson.get("service").getAsString());
+                    }
+                    appEngineHttpRequestBuilder.setAppEngineRouting(routingBuilder.build());
+                }
+                if (httpJson.has("headers")) {
+                    com.google.gson.JsonObject headersJson = httpJson.getAsJsonObject("headers");
+                    for (Map.Entry<String, com.google.gson.JsonElement> entry : headersJson.entrySet()) {
+                        appEngineHttpRequestBuilder.putHeaders(entry.getKey(), entry.getValue().getAsString());
+                    }
+                }
+            }
+
+            Task.Builder taskBuilder = Task.newBuilder()
+                .setName(fullTaskName)
+                .setAppEngineHttpRequest(appEngineHttpRequestBuilder.build());
+
+            if (taskJson != null && taskJson.has("scheduleTime")) {
+                String isoTime = taskJson.get("scheduleTime").getAsString();
+                java.time.Instant instant = java.time.Instant.parse(isoTime);
+                Timestamp ts = Timestamp.newBuilder()
+                    .setSeconds(instant.getEpochSecond())
+                    .setNanos(instant.getNano())
+                    .build();
+                taskBuilder.setScheduleTime(ts);
+            }
+
+            CreateTaskRequest request = CreateTaskRequest.newBuilder()
+                .setParent(parent.toString())
+                .setTask(taskBuilder.build())
+                .build();
+
+            client.createTask(request);
+            return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.OK;
+        } catch (AlreadyExistsException e) {
+            logger.info("CLOUDTASK: Task already exists (idempotency): " + taskName);
+            return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.TASK_ALREADY_EXISTS;
+        } catch (NotFoundException e) {
+            logger.warning("CLOUDTASK: Queue not found: " + queueName);
+            return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE;
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "CLOUDTASK: Client SDK exception dispatching task " + taskName + ": " + e.getMessage(), e);
+            return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.INTERNAL_ERROR;
+        }
+    }
 }
