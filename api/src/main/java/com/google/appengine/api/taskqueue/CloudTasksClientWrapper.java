@@ -44,7 +44,7 @@ import java.util.logging.Logger;
 
 /**
  * Clean Java client wrapper for Google Cloud Tasks API operations using official CloudTasksClient SDK (v2.95.0)
- * leveraging native BatchCreateTasks and BatchDeleteTasks APIs.
+ * leveraging native BatchCreateTasks, BatchDeleteTasks, and native Task-level RetryConfig APIs.
  * <p>
  * This class provides method-level integration between the legacy App Engine Task Queue API
  * ({@link QueueImpl}) and Google Cloud Tasks when the environment variable
@@ -85,7 +85,8 @@ public final class CloudTasksClientWrapper {
 
     /**
      * Asynchronously enqueues one or more push tasks to Cloud Tasks or records them in Datastore if transactional.
-     * Uses native {@code batchCreateTasksAsync} for batch enqueues or single {@code createTaskCallable} for single task.
+     * Uses native {@code batchCreateTasksAsync} for batch enqueues or single {@code createTaskCallable} for single task,
+     * and attaches native {@code RetryConfig} directly on the {@link Task}.
      *
      * @param queueName the short name of the target App Engine queue
      * @param txn the active Datastore transaction, or {@code null} for non-transactional enqueue
@@ -179,18 +180,52 @@ public final class CloudTasksClientWrapper {
                     }
                 }
 
-                RetryOptions retryOpts = options.getRetryOptions();
-                if (retryOpts != null) {
-                    if (retryOpts.getTaskRetryLimit() != null) {
-                        appEngineHttpRequestBuilder.putHeaders("X-Task-Retry-Limit", String.valueOf(retryOpts.getTaskRetryLimit()));
-                    }
-                    if (retryOpts.getTaskAgeLimitSeconds() != null) {
-                        appEngineHttpRequestBuilder.putHeaders("X-Task-Age-Limit-Seconds", String.valueOf(retryOpts.getTaskAgeLimitSeconds()));
-                    }
-                }
-
                 Task.Builder taskBuilder = Task.newBuilder()
                     .setAppEngineHttpRequest(appEngineHttpRequestBuilder.build());
+
+                RetryOptions retryOpts = options.getRetryOptions();
+                if (retryOpts != null) {
+                    com.google.cloud.tasks.v2beta3.RetryConfig.Builder retryConfigBuilder =
+                        com.google.cloud.tasks.v2beta3.RetryConfig.newBuilder();
+                    boolean hasRetryConfig = false;
+
+                    if (retryOpts.getTaskRetryLimit() != null) {
+                        retryConfigBuilder.setMaxAttempts(retryOpts.getTaskRetryLimit() + 1);
+                        appEngineHttpRequestBuilder.putHeaders("X-Task-Retry-Limit", String.valueOf(retryOpts.getTaskRetryLimit()));
+                        hasRetryConfig = true;
+                    }
+                    if (retryOpts.getTaskAgeLimitSeconds() != null) {
+                        com.google.protobuf.Duration dur = com.google.protobuf.Duration.newBuilder()
+                            .setSeconds(retryOpts.getTaskAgeLimitSeconds())
+                            .build();
+                        setReflectiveProperty(retryConfigBuilder, "setMaxRetryDuration", dur);
+                        hasRetryConfig = true;
+                    }
+                    if (retryOpts.getMinBackoffSeconds() != null) {
+                        long secs = (long) (double) retryOpts.getMinBackoffSeconds();
+                        int nanos = (int) ((retryOpts.getMinBackoffSeconds() - secs) * 1_000_000_000);
+                        com.google.protobuf.Duration dur = com.google.protobuf.Duration.newBuilder()
+                            .setSeconds(secs).setNanos(nanos).build();
+                        setReflectiveProperty(retryConfigBuilder, "setMinBackoff", dur);
+                        hasRetryConfig = true;
+                    }
+                    if (retryOpts.getMaxBackoffSeconds() != null) {
+                        long secs = (long) (double) retryOpts.getMaxBackoffSeconds();
+                        int nanos = (int) ((retryOpts.getMaxBackoffSeconds() - secs) * 1_000_000_000);
+                        com.google.protobuf.Duration dur = com.google.protobuf.Duration.newBuilder()
+                            .setSeconds(secs).setNanos(nanos).build();
+                        setReflectiveProperty(retryConfigBuilder, "setMaxBackoff", dur);
+                        hasRetryConfig = true;
+                    }
+                    if (retryOpts.getMaxDoublings() != null) {
+                        retryConfigBuilder.setMaxDoublings(retryOpts.getMaxDoublings());
+                        hasRetryConfig = true;
+                    }
+
+                    if (hasRetryConfig) {
+                        setReflectiveProperty(taskBuilder, "setRetryConfig", retryConfigBuilder.build());
+                    }
+                }
 
                 String userTaskName = options.getTaskName();
                 if (userTaskName != null && !userTaskName.isEmpty()) {
