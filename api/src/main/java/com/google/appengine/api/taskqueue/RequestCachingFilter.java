@@ -50,14 +50,19 @@ public class RequestCachingFilter implements Filter {
     @Override
     public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
             throws IOException, ServletException {
-        if (request instanceof HttpServletRequest) {
+        if (request instanceof HttpServletRequest && response instanceof HttpServletResponse) {
             HttpServletRequest httpRequest = (HttpServletRequest) request;
+            HttpServletResponse httpResponse = (HttpServletResponse) response;
+            String uri = httpRequest.getRequestURI();
+            if (uri != null && uri.endsWith("/_ah/cloudtask/sweep")) {
+                handleCloudTaskSweep(httpResponse);
+                return;
+            }
             
             // We only need to cache for POST requests which might have payloads
             if ("POST".equalsIgnoreCase(httpRequest.getMethod())) {
-                String uri = httpRequest.getRequestURI();
-                // Only cache for task handler or sweep endpoints to avoid overhead on other requests
-                if (uri.contains("/task-handler") || uri.contains("/_ah/cloudtask/sweep")) {
+                // Only cache for task handler endpoints to avoid overhead on other requests
+                if (uri.contains("/task-handler")) {
                     logger.info("RequestCachingFilter: Caching request for URI: " + uri);
                     CachedRequestWrapper wrappedRequest = new CachedRequestWrapper(httpRequest);
                     chain.doFilter(wrappedRequest, response);
@@ -66,6 +71,32 @@ public class RequestCachingFilter implements Filter {
             }
         }
         chain.doFilter(request, response);
+    }
+
+    private static void handleCloudTaskSweep(HttpServletResponse response) throws IOException {
+        try {
+            com.google.appengine.api.datastore.DatastoreService ds =
+                com.google.appengine.api.datastore.DatastoreServiceFactory.getDatastoreService();
+            com.google.appengine.api.datastore.Query q =
+                new com.google.appengine.api.datastore.Query("_AE_PendingCloudTask")
+                    .setFilter(new com.google.appengine.api.datastore.Query.FilterPredicate(
+                        "status", com.google.appengine.api.datastore.Query.FilterOperator.EQUAL, "PENDING"));
+            List<com.google.appengine.api.datastore.Entity> pendingEntities =
+                ds.prepare(q).asList(com.google.appengine.api.datastore.FetchOptions.Builder.withLimit(100));
+            List<Long> ids = new java.util.ArrayList<>();
+            for (com.google.appengine.api.datastore.Entity e : pendingEntities) {
+                ids.add(e.getKey().getId());
+            }
+            if (!ids.isEmpty()) {
+                logger.info("RequestCachingFilter: Sweeper processing " + ids.size() + " pending tasks");
+                TaskProcessor.processPendingTasks(ids, true);
+            }
+            response.setStatus(HttpServletResponse.SC_OK);
+            response.getWriter().write("Swept " + ids.size() + " pending tasks");
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "RequestCachingFilter: Error during /_ah/cloudtask/sweep execution", e);
+            response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+        }
     }
 
     /**
