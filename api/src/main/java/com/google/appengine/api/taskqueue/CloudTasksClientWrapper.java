@@ -3,15 +3,16 @@ package com.google.appengine.api.taskqueue;
 import com.google.appengine.api.datastore.DatastoreService;
 import com.google.appengine.api.datastore.DatastoreServiceFactory;
 import com.google.appengine.api.datastore.Entity;
+import com.google.appengine.api.datastore.Key;
 import com.google.appengine.api.datastore.Transaction;
 import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueFetchQueueStatsResponse;
 import com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueScannerQueueInfo;
 
 import com.google.cloud.tasks.v2beta3.AppEngineHttpRequest;
 import com.google.cloud.tasks.v2beta3.AppEngineRouting;
-import com.google.cloud.tasks.v2beta3.BatchCreateTasksResponse;
 import com.google.cloud.tasks.v2beta3.CloudTasksClient;
 import com.google.cloud.tasks.v2beta3.CreateTaskRequest;
+import com.google.cloud.tasks.v2beta3.DeleteTaskRequest;
 import com.google.cloud.tasks.v2beta3.GetQueueRequest;
 import com.google.cloud.tasks.v2beta3.Queue;
 import com.google.cloud.tasks.v2beta3.QueueName;
@@ -37,14 +38,14 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Clean Java client wrapper for Google Cloud Tasks API operations using official CloudTasksClient SDK (v2.95.0)
- * leveraging native BatchCreateTasks, BatchDeleteTasks, and native Task-level RetryConfig APIs.
+ * Clean Java client wrapper for Google Cloud Tasks API operations using official CloudTasksClient SDK.
  * <p>
  * This class provides method-level integration between the legacy App Engine Task Queue API
  * ({@link QueueImpl}) and Google Cloud Tasks when the environment variable
@@ -83,10 +84,13 @@ public final class CloudTasksClientWrapper {
         return Boolean.parseBoolean(System.getenv(ENV_VAR));
     }
 
+    private static String getDefaultServiceName() {
+        String serviceName = System.getenv("GAE_SERVICE");
+        return (serviceName != null && !serviceName.isEmpty()) ? serviceName : "default";
+    }
+
     /**
      * Asynchronously enqueues one or more push tasks to Cloud Tasks or records them in Datastore if transactional.
-     * Uses native {@code batchCreateTasksAsync} for batch enqueues or single {@code createTaskCallable} for single task,
-     * and attaches native {@code RetryConfig} directly on the {@link Task}.
      *
      * @param queueName the short name of the target App Engine queue
      * @param txn the active Datastore transaction, or {@code null} for non-transactional enqueue
@@ -95,173 +99,93 @@ public final class CloudTasksClientWrapper {
      */
     public static Future<List<TaskHandle>> addAsync(String queueName, Transaction txn, List<TaskOptions> taskOptionsList) {
         String effectiveQueue = (queueName == null || queueName.isEmpty()) ? "default" : queueName;
-        String projectId = TaskProcessor.getProjectId();
-        String location = TaskProcessor.getLocation();
-
-        String serviceName = System.getenv("GAE_SERVICE");
-        if (serviceName == null || serviceName.isEmpty()) {
-            serviceName = "taskqueue-java-cloudtask-service";
-        }
 
         if (txn != null) {
-            List<TaskHandle> createdHandles = new ArrayList<>();
-            List<Entity> transactionalEntities = new ArrayList<>();
-            QueueName parent = QueueName.of(projectId, location, effectiveQueue);
-
-            for (TaskOptions options : taskOptionsList) {
-                String userTaskName = options.getTaskName();
-                String pendingName = (userTaskName != null && !userTaskName.isEmpty()) ? userTaskName : "task-" + java.util.UUID.randomUUID();
-                String jsonPayload = buildTaskJson(parent.toString(), pendingName, options);
-
-                Entity pendingTask = new Entity("_AE_PendingCloudTask");
-                pendingTask.setProperty("queue_name", effectiveQueue);
-                pendingTask.setProperty("cloud_task_name", pendingName);
-                pendingTask.setProperty("cloud_task_payload", jsonPayload);
-                pendingTask.setProperty("created", new java.util.Date());
-                pendingTask.setProperty("status", "PENDING");
-                pendingTask.setProperty("lock_expires", null);
-                pendingTask.setProperty("retry_count", 0L);
-                pendingTask.setProperty("last_error", "");
-                pendingTask.setProperty("handled_by_sweeper", false);
-                pendingTask.setProperty("sdk_lang", "JAVA");
-                transactionalEntities.add(pendingTask);
-
-                long scheduleTimeMs = System.currentTimeMillis();
-                if (options.getEtaMillis() != null) {
-                    scheduleTimeMs = options.getEtaMillis();
-                } else if (options.getCountdownMillis() != null) {
-                    scheduleTimeMs += options.getCountdownMillis();
-                }
-
-                TaskOptions handleOptions = new TaskOptions(options);
-                handleOptions.taskName(pendingName);
-                TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
-                handle.etaUsec(scheduleTimeMs * 1000L);
-                createdHandles.add(handle);
-            }
-
-            DatastoreService ds = DatastoreServiceFactory.getDatastoreService();
-            List<com.google.appengine.api.datastore.Key> keys = ds.put(txn, transactionalEntities);
-            List<Long> taskIds = new ArrayList<>();
-            for (com.google.appengine.api.datastore.Key k : keys) {
-                taskIds.add(k.getId());
-            }
-
-            try {
-                Class<?> filterClass = Class.forName("com.google.appengine.api.taskqueue.RequestCachingFilter");
-                java.lang.reflect.Method addPendingMethod = filterClass.getMethod("addPendingTasks", List.class);
-                addPendingMethod.invoke(null, taskIds);
-            } catch (Exception e) {
-                logger.log(Level.FINE, "RequestCachingFilter not present or reflective call failed", e);
-            }
-
-            return CompletableFuture.completedFuture(createdHandles);
+            return enqueueTransactional(effectiveQueue, txn, taskOptionsList);
         }
+
+        return enqueueNonTransactional(effectiveQueue, taskOptionsList);
+    }
+
+    private static Future<List<TaskHandle>> enqueueTransactional(
+            String effectiveQueue, Transaction txn, List<TaskOptions> taskOptionsList) {
+        String projectId = TaskProcessor.getProjectId();
+        String location = TaskProcessor.getLocation();
+        QueueName parent = QueueName.of(projectId, location, effectiveQueue);
+
+        List<TaskHandle> createdHandles = new ArrayList<>();
+        List<Entity> transactionalEntities = new ArrayList<>();
+
+        for (TaskOptions options : taskOptionsList) {
+            String userTaskName = options.getTaskName();
+            String pendingName = (userTaskName != null && !userTaskName.isEmpty())
+                ? userTaskName : "task-" + UUID.randomUUID();
+
+            String jsonPayload = buildTaskJson(parent.toString(), pendingName, options);
+
+            Entity pendingTask = new Entity("_AE_PendingCloudTask");
+            pendingTask.setProperty("queue_name", effectiveQueue);
+            pendingTask.setProperty("cloud_task_name", pendingName);
+            pendingTask.setProperty("cloud_task_payload", jsonPayload);
+            pendingTask.setProperty("created", new java.util.Date());
+            pendingTask.setProperty("status", "PENDING");
+            pendingTask.setProperty("lock_expires", null);
+            pendingTask.setProperty("retry_count", 0L);
+            pendingTask.setProperty("last_error", "");
+            pendingTask.setProperty("handled_by_sweeper", false);
+            pendingTask.setProperty("sdk_lang", "JAVA");
+            transactionalEntities.add(pendingTask);
+
+            long scheduleTimeMs = calculateScheduleTimeMs(options);
+            TaskOptions handleOptions = new TaskOptions(options);
+            handleOptions.taskName(pendingName);
+            TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
+            handle.etaUsec(scheduleTimeMs * 1000L);
+            createdHandles.add(handle);
+        }
+
+        DatastoreService ds = DatastoreServiceFactory.getDatastoreService();
+        List<Key> keys = ds.put(txn, transactionalEntities);
+        List<Long> taskIds = new ArrayList<>();
+        for (Key k : keys) {
+            taskIds.add(k.getId());
+        }
+
+        notifyRequestCachingFilterIfPresent(taskIds);
+
+        return CompletableFuture.completedFuture(createdHandles);
+    }
+
+    private static void notifyRequestCachingFilterIfPresent(List<Long> taskIds) {
+        try {
+            Class<?> filterClass = Class.forName("com.google.appengine.api.taskqueue.RequestCachingFilter");
+            java.lang.reflect.Method addPendingMethod = filterClass.getMethod("addPendingTasks", List.class);
+            addPendingMethod.invoke(null, taskIds);
+        } catch (Exception e) {
+            logger.log(Level.FINE, "RequestCachingFilter not present or reflective call failed", e);
+        }
+    }
+
+    private static Future<List<TaskHandle>> enqueueNonTransactional(
+            String effectiveQueue, List<TaskOptions> taskOptionsList) {
+        String projectId = TaskProcessor.getProjectId();
+        String location = TaskProcessor.getLocation();
+        String serviceName = getDefaultServiceName();
+        QueueName parent = QueueName.of(projectId, location, effectiveQueue);
 
         try {
             CloudTasksClient client = getClient();
-            QueueName parent = QueueName.of(projectId, location, effectiveQueue);
-            List<CreateTaskRequest> requests = new ArrayList<>();
-            List<Long> finalScheduleTimes = new ArrayList<>();
+            List<CompletableFuture<TaskHandle>> taskFutures = new ArrayList<>();
 
             for (TaskOptions options : taskOptionsList) {
-                AppEngineHttpRequest.Builder appEngineHttpRequestBuilder = AppEngineHttpRequest.newBuilder()
-                    .setRelativeUri(options.getUrl() != null && !options.getUrl().isEmpty() ? options.getUrl() : "/")
-                    .setAppEngineRouting(AppEngineRouting.newBuilder().setService(serviceName).build());
+                long[] scheduleTimeHolder = new long[1];
+                CreateTaskRequest req = buildCreateTaskRequest(
+                    parent, projectId, location, effectiveQueue, serviceName, options, scheduleTimeHolder);
 
-                byte[] payload = options.getPayload();
-                if (payload != null && payload.length > 0) {
-                    setReflectiveProperty(appEngineHttpRequestBuilder, "setBody", payload);
-                }
+                final long finalScheduleTimeMs = scheduleTimeHolder[0];
+                final String userTaskName = options.getTaskName();
 
-                for (Map.Entry<String, List<String>> entry : options.getHeaders().entrySet()) {
-                    for (String val : entry.getValue()) {
-                        appEngineHttpRequestBuilder.putHeaders(entry.getKey(), val);
-                    }
-                }
-
-                Task.Builder taskBuilder = Task.newBuilder()
-                    .setAppEngineHttpRequest(appEngineHttpRequestBuilder.build());
-
-                RetryOptions retryOpts = options.getRetryOptions();
-                if (retryOpts != null) {
-                    com.google.cloud.tasks.v2beta3.RetryConfig.Builder retryConfigBuilder =
-                        com.google.cloud.tasks.v2beta3.RetryConfig.newBuilder();
-                    boolean hasRetryConfig = false;
-
-                    if (retryOpts.getTaskRetryLimit() != null) {
-                        retryConfigBuilder.setMaxAttempts(retryOpts.getTaskRetryLimit() + 1);
-                        appEngineHttpRequestBuilder.putHeaders("X-Task-Retry-Limit", String.valueOf(retryOpts.getTaskRetryLimit()));
-                        hasRetryConfig = true;
-                    }
-                    if (retryOpts.getTaskAgeLimitSeconds() != null) {
-                        com.google.protobuf.Duration dur = com.google.protobuf.Duration.newBuilder()
-                            .setSeconds(retryOpts.getTaskAgeLimitSeconds())
-                            .build();
-                        setReflectiveProperty(retryConfigBuilder, "setMaxRetryDuration", dur);
-                        hasRetryConfig = true;
-                    }
-                    if (retryOpts.getMinBackoffSeconds() != null) {
-                        long secs = (long) (double) retryOpts.getMinBackoffSeconds();
-                        int nanos = (int) ((retryOpts.getMinBackoffSeconds() - secs) * 1_000_000_000);
-                        com.google.protobuf.Duration dur = com.google.protobuf.Duration.newBuilder()
-                            .setSeconds(secs).setNanos(nanos).build();
-                        setReflectiveProperty(retryConfigBuilder, "setMinBackoff", dur);
-                        hasRetryConfig = true;
-                    }
-                    if (retryOpts.getMaxBackoffSeconds() != null) {
-                        long secs = (long) (double) retryOpts.getMaxBackoffSeconds();
-                        int nanos = (int) ((retryOpts.getMaxBackoffSeconds() - secs) * 1_000_000_000);
-                        com.google.protobuf.Duration dur = com.google.protobuf.Duration.newBuilder()
-                            .setSeconds(secs).setNanos(nanos).build();
-                        setReflectiveProperty(retryConfigBuilder, "setMaxBackoff", dur);
-                        hasRetryConfig = true;
-                    }
-                    if (retryOpts.getMaxDoublings() != null) {
-                        retryConfigBuilder.setMaxDoublings(retryOpts.getMaxDoublings());
-                        hasRetryConfig = true;
-                    }
-
-                    if (hasRetryConfig) {
-                        setReflectiveProperty(taskBuilder, "setRetryConfig", retryConfigBuilder.build());
-                    }
-                }
-
-                String userTaskName = options.getTaskName();
-                if (userTaskName != null && !userTaskName.isEmpty()) {
-                    taskBuilder.setName(TaskName.of(projectId, location, effectiveQueue, userTaskName).toString());
-                }
-
-                long scheduleTimeMs = System.currentTimeMillis();
-                boolean hasDelay = false;
-                if (options.getEtaMillis() != null) {
-                    scheduleTimeMs = options.getEtaMillis();
-                    hasDelay = true;
-                } else if (options.getCountdownMillis() != null) {
-                    scheduleTimeMs += options.getCountdownMillis();
-                    hasDelay = true;
-                }
-                finalScheduleTimes.add(scheduleTimeMs);
-                if (hasDelay && scheduleTimeMs > System.currentTimeMillis() + 100L) {
-                    Timestamp ts = Timestamp.newBuilder()
-                        .setSeconds(scheduleTimeMs / 1000L)
-                        .setNanos((int) ((scheduleTimeMs % 1000L) * 1_000_000))
-                        .build();
-                    setReflectiveProperty(taskBuilder, "setScheduleTime", ts);
-                }
-
-                CreateTaskRequest req = CreateTaskRequest.newBuilder()
-                    .setParent(parent.toString())
-                    .setTask(taskBuilder.build())
-                    .build();
-                requests.add(req);
-            }
-
-            if (requests.size() == 1) {
-                CreateTaskRequest req = requests.get(0);
-                TaskOptions options = taskOptionsList.get(0);
-                final long finalScheduleTimeMs = finalScheduleTimes.get(0);
-                CompletableFuture<List<TaskHandle>> cf = new CompletableFuture<>();
+                CompletableFuture<TaskHandle> cf = new CompletableFuture<>();
                 ApiFuture<Task> apiFuture = client.createTaskCallable().futureCall(req);
                 ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Task>() {
                     @Override
@@ -271,103 +195,139 @@ public final class CloudTasksClientWrapper {
                         handleOptions.taskName(chosenTaskName);
                         TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
                         handle.etaUsec(finalScheduleTimeMs * 1000L);
-                        cf.complete(Collections.singletonList(handle));
+                        cf.complete(handle);
                     }
 
                     @Override
                     public void onFailure(Throwable t) {
-                        String userTaskName = options.getTaskName();
-                        if (isAlreadyExists(t)) {
-                            String nameForErr = (userTaskName != null && !userTaskName.isEmpty()) ? userTaskName : "unknown";
-                            cf.completeExceptionally(new TaskAlreadyExistsException("Task already exists: " + nameForErr));
-                        } else if (isUnknownQueue(t)) {
-                            cf.completeExceptionally(new IllegalStateException("The specified queue is unknown : " + effectiveQueue, t));
-                        } else {
-                            cf.completeExceptionally(new RuntimeException("Failed to enqueue task to Cloud Tasks via Client SDK: " + t.getMessage(), t));
-                        }
+                        cf.completeExceptionally(handleCreateTaskError(t, userTaskName, effectiveQueue));
                     }
                 }, MoreExecutors.directExecutor());
-                return cf;
-            } else {
-                // Use native BatchCreateTasks API in CloudTasksClient 2.95.0
-                try {
-                    BatchCreateTasksResponse resp = client.batchCreateTasksAsync(parent, requests).get();
-                    List<TaskHandle> createdHandles = new ArrayList<>();
-                    for (int i = 0; i < resp.getTasksCount(); i++) {
-                        Task createdTask = resp.getTasks(i);
-                        String chosenTaskName = TaskName.parse(createdTask.getName()).getTask();
-                        TaskOptions handleOptions = new TaskOptions(taskOptionsList.get(i));
-                        handleOptions.taskName(chosenTaskName);
-                        TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
-                        handle.etaUsec(finalScheduleTimes.get(i) * 1000L);
-                        createdHandles.add(handle);
-                    }
-                    return CompletableFuture.completedFuture(createdHandles);
-                } catch (Throwable ex) {
-                    // Fallback to parallel execution if BatchCreateTasks API is unavailable in container
-                    List<CompletableFuture<TaskHandle>> taskFutures = new ArrayList<>();
-                    for (int i = 0; i < requests.size(); i++) {
-                        CreateTaskRequest req = requests.get(i);
-                        TaskOptions options = taskOptionsList.get(i);
-                        final long finalScheduleTimeMs = finalScheduleTimes.get(i);
-                        CompletableFuture<TaskHandle> singleCf = new CompletableFuture<>();
-                        ApiFuture<Task> apiFuture = client.createTaskCallable().futureCall(req);
-                        ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Task>() {
-                            @Override
-                            public void onSuccess(Task createdTask) {
-                                String chosenTaskName = TaskName.parse(createdTask.getName()).getTask();
-                                TaskOptions handleOptions = new TaskOptions(options);
-                                handleOptions.taskName(chosenTaskName);
-                                TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
-                                handle.etaUsec(finalScheduleTimeMs * 1000L);
-                                singleCf.complete(handle);
-                            }
 
-                            @Override
-                            public void onFailure(Throwable t) {
-                                String userTaskName = options.getTaskName();
-                                if (isAlreadyExists(t)) {
-                                    String nameForErr = (userTaskName != null && !userTaskName.isEmpty()) ? userTaskName : "unknown";
-                                    singleCf.completeExceptionally(new TaskAlreadyExistsException("Task already exists: " + nameForErr));
-                                } else if (isUnknownQueue(t)) {
-                                    singleCf.completeExceptionally(new IllegalStateException("The specified queue is unknown : " + effectiveQueue, t));
-                                } else {
-                                    singleCf.completeExceptionally(new RuntimeException("Failed to enqueue task to Cloud Tasks via Client SDK: " + t.getMessage(), t));
-                                }
-                            }
-                        }, MoreExecutors.directExecutor());
-                        taskFutures.add(singleCf);
-                    }
-                    List<TaskHandle> createdHandles = new ArrayList<>();
-                    TaskAlreadyExistsException taee = null;
-                    for (CompletableFuture<TaskHandle> singleCf : taskFutures) {
-                        try {
-                            createdHandles.add(singleCf.join());
-                        } catch (java.util.concurrent.CompletionException ce) {
-                            Throwable cause = ce.getCause();
-                            if (cause instanceof TaskAlreadyExistsException) {
-                                if (taee == null) taee = (TaskAlreadyExistsException) cause;
-                                else taee.appendTaskName(cause.getMessage());
-                            } else if (cause instanceof RuntimeException) {
-                                throw (RuntimeException) cause;
-                            } else {
-                                throw new RuntimeException(cause);
-                            }
-                        }
-                    }
-                    if (taee != null) throw taee;
-                    return CompletableFuture.completedFuture(createdHandles);
-                }
+                taskFutures.add(cf);
             }
+
+            return awaitAllTaskCreationFutures(taskFutures);
         } catch (Exception e) {
             if (e instanceof RuntimeException) throw (RuntimeException) e;
             throw new RuntimeException("Failed to initialize CloudTasksClient", e);
         }
     }
 
+    private static CreateTaskRequest buildCreateTaskRequest(
+            QueueName parent, String projectId, String location, String effectiveQueue,
+            String serviceName, TaskOptions options, long[] scheduleTimeHolder) {
+
+        AppEngineHttpRequest httpRequest = buildAppEngineHttpRequest(serviceName, options);
+
+        Task.Builder taskBuilder = Task.newBuilder()
+            .setAppEngineHttpRequest(httpRequest);
+
+        String userTaskName = options.getTaskName();
+        if (userTaskName != null && !userTaskName.isEmpty()) {
+            taskBuilder.setName(TaskName.of(projectId, location, effectiveQueue, userTaskName).toString());
+        }
+
+        long scheduleTimeMs = calculateScheduleTimeMs(options);
+        scheduleTimeHolder[0] = scheduleTimeMs;
+
+        if (isDelayed(options) && scheduleTimeMs > System.currentTimeMillis() + 100L) {
+            Timestamp ts = Timestamp.newBuilder()
+                .setSeconds(scheduleTimeMs / 1000L)
+                .setNanos((int) ((scheduleTimeMs % 1000L) * 1_000_000))
+                .build();
+            setReflectiveProperty(taskBuilder, "setScheduleTime", ts);
+        }
+
+        return CreateTaskRequest.newBuilder()
+            .setParent(parent.toString())
+            .setTask(taskBuilder.build())
+            .build();
+    }
+
+    private static AppEngineHttpRequest buildAppEngineHttpRequest(String serviceName, TaskOptions options) {
+        AppEngineHttpRequest.Builder builder = AppEngineHttpRequest.newBuilder()
+            .setRelativeUri(options.getUrl() != null && !options.getUrl().isEmpty() ? options.getUrl() : "/")
+            .setAppEngineRouting(AppEngineRouting.newBuilder().setService(serviceName).build());
+
+        byte[] payload = options.getPayload();
+        if (payload != null && payload.length > 0) {
+            setReflectiveProperty(builder, "setBody", payload);
+        }
+
+        for (Map.Entry<String, List<String>> entry : options.getHeaders().entrySet()) {
+            for (String val : entry.getValue()) {
+                builder.putHeaders(entry.getKey(), val);
+            }
+        }
+
+        applyRetryOptions(builder, options.getRetryOptions());
+
+        return builder.build();
+    }
+
+    private static void applyRetryOptions(AppEngineHttpRequest.Builder builder, RetryOptions retryOpts) {
+        if (retryOpts == null) return;
+
+        if (retryOpts.getTaskRetryLimit() != null) {
+            builder.putHeaders("X-Task-Retry-Limit", String.valueOf(retryOpts.getTaskRetryLimit()));
+        }
+        if (retryOpts.getTaskAgeLimitSeconds() != null) {
+            builder.putHeaders("X-Task-Age-Limit-Seconds", String.valueOf(retryOpts.getTaskAgeLimitSeconds()));
+        }
+    }
+
+    private static boolean isDelayed(TaskOptions options) {
+        return options.getEtaMillis() != null || options.getCountdownMillis() != null;
+    }
+
+    private static long calculateScheduleTimeMs(TaskOptions options) {
+        long scheduleTimeMs = System.currentTimeMillis();
+        if (options.getEtaMillis() != null) {
+            scheduleTimeMs = options.getEtaMillis();
+        } else if (options.getCountdownMillis() != null) {
+            scheduleTimeMs += options.getCountdownMillis();
+        }
+        return scheduleTimeMs;
+    }
+
+    private static Throwable handleCreateTaskError(Throwable t, String userTaskName, String effectiveQueue) {
+        String nameForErr = (userTaskName != null && !userTaskName.isEmpty()) ? userTaskName : "unknown";
+        if (isAlreadyExists(t)) {
+            return new TaskAlreadyExistsException("Task already exists: " + nameForErr);
+        } else if (isUnknownQueue(t)) {
+            return new IllegalStateException("The specified queue is unknown : " + effectiveQueue, t);
+        } else {
+            return new RuntimeException("Failed to enqueue task to Cloud Tasks via Client SDK: " + t.getMessage(), t);
+        }
+    }
+
+    private static Future<List<TaskHandle>> awaitAllTaskCreationFutures(List<CompletableFuture<TaskHandle>> taskFutures) {
+        List<TaskHandle> createdHandles = new ArrayList<>();
+        TaskAlreadyExistsException taee = null;
+
+        for (CompletableFuture<TaskHandle> cf : taskFutures) {
+            try {
+                createdHandles.add(cf.join());
+            } catch (java.util.concurrent.CompletionException ce) {
+                Throwable cause = ce.getCause();
+                if (cause instanceof TaskAlreadyExistsException) {
+                    if (taee == null) taee = (TaskAlreadyExistsException) cause;
+                    else taee.appendTaskName(cause.getMessage());
+                } else if (cause instanceof RuntimeException) {
+                    throw (RuntimeException) cause;
+                } else {
+                    throw new RuntimeException(cause);
+                }
+            }
+        }
+        if (taee != null) throw taee;
+        return CompletableFuture.completedFuture(createdHandles);
+    }
+
     /**
-     * Asynchronously deletes one or more tasks from Cloud Tasks by task handle using native {@code batchDeleteTasksAsync}
-     * or parallel fallback execution.
+     * Asynchronously deletes one or more tasks from Cloud Tasks by task handle concurrently in parallel
+     * using official Client SDK.
      *
      * @param queueName the short name of the target App Engine queue
      * @param taskHandles the list of task handles to delete
@@ -377,48 +337,36 @@ public final class CloudTasksClientWrapper {
         String effectiveQueue = (queueName == null || queueName.isEmpty()) ? "default" : queueName;
         String projectId = TaskProcessor.getProjectId();
         String location = TaskProcessor.getLocation();
-        QueueName parent = QueueName.of(projectId, location, effectiveQueue);
 
         try {
             CloudTasksClient client = getClient();
-            List<String> taskNames = new ArrayList<>();
+            List<CompletableFuture<Boolean>> futures = new ArrayList<>();
             for (TaskHandle handle : taskHandles) {
-                taskNames.add(TaskName.of(projectId, location, effectiveQueue, handle.getName()).toString());
+                TaskName taskName = TaskName.of(projectId, location, effectiveQueue, handle.getName());
+                DeleteTaskRequest req = DeleteTaskRequest.newBuilder().setName(taskName.toString()).build();
+
+                CompletableFuture<Boolean> cf = new CompletableFuture<>();
+                ApiFuture<?> apiFuture = client.deleteTaskCallable().futureCall(req);
+                ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Object>() {
+                    @Override
+                    public void onSuccess(Object result) {
+                        cf.complete(Boolean.TRUE);
+                    }
+
+                    @Override
+                    public void onFailure(Throwable t) {
+                        logger.log(Level.WARNING, "Failed to delete Cloud Task via Client SDK: " + taskName, t);
+                        cf.complete(Boolean.FALSE);
+                    }
+                }, MoreExecutors.directExecutor());
+                futures.add(cf);
             }
 
-            try {
-                client.batchDeleteTasksAsync(parent, taskNames).get();
-                List<Boolean> results = new ArrayList<>();
-                for (int i = 0; i < taskHandles.size(); i++) results.add(Boolean.TRUE);
-                return CompletableFuture.completedFuture(results);
-            } catch (Throwable ex) {
-                // Fallback to individual delete calls if BatchDeleteTasks API is unavailable in container
-                List<CompletableFuture<Boolean>> futures = new ArrayList<>();
-                for (String tName : taskNames) {
-                    CompletableFuture<Boolean> cf = new CompletableFuture<>();
-                    com.google.cloud.tasks.v2beta3.DeleteTaskRequest req =
-                        com.google.cloud.tasks.v2beta3.DeleteTaskRequest.newBuilder().setName(tName).build();
-                    ApiFuture<?> apiFuture = client.deleteTaskCallable().futureCall(req);
-                    ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Object>() {
-                        @Override
-                        public void onSuccess(Object result) {
-                            cf.complete(Boolean.TRUE);
-                        }
-
-                        @Override
-                        public void onFailure(Throwable t) {
-                            cf.complete(Boolean.FALSE);
-                        }
-                    }, MoreExecutors.directExecutor());
-                    futures.add(cf);
-                }
-
-                List<Boolean> results = new ArrayList<>();
-                for (CompletableFuture<Boolean> cf : futures) {
-                    results.add(cf.join());
-                }
-                return CompletableFuture.completedFuture(results);
+            List<Boolean> results = new ArrayList<>();
+            for (CompletableFuture<Boolean> cf : futures) {
+                results.add(cf.join());
             }
+            return CompletableFuture.completedFuture(results);
         } catch (Exception e) {
             logger.log(Level.SEVERE, "Failed to initialize CloudTasksClient for delete", e);
             List<Boolean> results = new ArrayList<>();
@@ -572,10 +520,7 @@ public final class CloudTasksClientWrapper {
     }
 
     private static String buildTaskJson(String fullQueueName, String taskName, TaskOptions options) {
-        String serviceName = System.getenv("GAE_SERVICE");
-        if (serviceName == null || serviceName.isEmpty()) {
-            serviceName = "taskqueue-java-cloudtask-service";
-        }
+        String serviceName = getDefaultServiceName();
         
         byte[] payload = options.getPayload();
         String base64Body = (payload != null && payload.length > 0) 
@@ -613,12 +558,7 @@ public final class CloudTasksClientWrapper {
         jsonBuilder.append("}"); // end headers
         jsonBuilder.append("}"); // end appEngineHttpRequest
         
-        long etaMillis = System.currentTimeMillis();
-        if (options.getEtaMillis() != null) {
-            etaMillis = options.getEtaMillis();
-        } else if (options.getCountdownMillis() != null) {
-            etaMillis += options.getCountdownMillis();
-        }
+        long etaMillis = calculateScheduleTimeMs(options);
         if (etaMillis > System.currentTimeMillis() + 1000L) {
             String isoTime = java.time.Instant.ofEpochMilli(etaMillis).toString();
             jsonBuilder.append(",\"scheduleTime\": \"").append(isoTime).append("\"");
