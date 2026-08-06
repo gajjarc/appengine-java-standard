@@ -74,16 +74,12 @@ public final class CloudTasksClientWrapper {
                             com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
                         com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
                             appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
-                        com.google.auth.oauth2.AccessToken accessToken =
-                            com.google.auth.oauth2.AccessToken.newBuilder()
-                                .setTokenValue(tokenResult.getAccessToken())
-                                .setExpirationTime(tokenResult.getExpirationTime())
-                                .build();
-                        com.google.auth.oauth2.GoogleCredentials credentials =
-                            com.google.auth.oauth2.GoogleCredentials.create(accessToken);
+                        com.google.api.gax.rpc.HeaderProvider headerProvider =
+                            com.google.api.gax.rpc.FixedHeaderProvider.create("Authorization", "Bearer " + tokenResult.getAccessToken());
                         com.google.cloud.tasks.v2beta3.CloudTasksSettings settings =
                             com.google.cloud.tasks.v2beta3.CloudTasksSettings.newBuilder()
-                                .setCredentialsProvider(com.google.api.gax.core.FixedCredentialsProvider.create(credentials))
+                                .setCredentialsProvider(com.google.api.gax.core.NoCredentialsProvider.create())
+                                .setHeaderProvider(headerProvider)
                                 .build();
                         sharedClient = CloudTasksClient.create(settings);
                     } catch (Exception e) {
@@ -252,11 +248,25 @@ public final class CloudTasksClientWrapper {
         scheduleTimeHolder[0] = scheduleTimeMs;
 
         if (isDelayed(options) && scheduleTimeMs > System.currentTimeMillis() + 100L) {
-            Timestamp ts = Timestamp.newBuilder()
-                .setSeconds(scheduleTimeMs / 1000L)
-                .setNanos((int) ((scheduleTimeMs % 1000L) * 1_000_000))
-                .build();
-            taskBuilder.setScheduleTime(ts);
+            long seconds = scheduleTimeMs / 1000L;
+            int nanos = (int) ((scheduleTimeMs % 1000L) * 1_000_000);
+            try {
+                for (java.lang.reflect.Method m : taskBuilder.getClass().getMethods()) {
+                    if (m.getName().equals("setScheduleTime") && m.getParameterCount() == 1) {
+                        Class<?> paramType = m.getParameterTypes()[0];
+                        if (paramType.getName().endsWith("Timestamp")) {
+                            Object tsBuilder = paramType.getMethod("newBuilder").invoke(null);
+                            tsBuilder.getClass().getMethod("setSeconds", long.class).invoke(tsBuilder, seconds);
+                            tsBuilder.getClass().getMethod("setNanos", int.class).invoke(tsBuilder, nanos);
+                            Object ts = tsBuilder.getClass().getMethod("build").invoke(tsBuilder);
+                            m.invoke(taskBuilder, ts);
+                            break;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to set scheduleTime on Task.Builder", e);
+            }
         }
 
         return CreateTaskRequest.newBuilder()
@@ -272,7 +282,21 @@ public final class CloudTasksClientWrapper {
 
         byte[] payload = options.getPayload();
         if (payload != null && payload.length > 0) {
-            builder.setBody(ByteString.copyFrom(payload));
+            try {
+                for (java.lang.reflect.Method m : builder.getClass().getMethods()) {
+                    if (m.getName().equals("setBody") && m.getParameterCount() == 1) {
+                        Class<?> paramType = m.getParameterTypes()[0];
+                        if (paramType.getName().endsWith("ByteString")) {
+                            java.lang.reflect.Method copyFrom = paramType.getMethod("copyFrom", byte[].class);
+                            Object bs = copyFrom.invoke(null, payload);
+                            m.invoke(builder, bs);
+                            break;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to set body on AppEngineHttpRequest.Builder", e);
+            }
         }
 
         for (Map.Entry<String, List<String>> entry : options.getHeaders().entrySet()) {
