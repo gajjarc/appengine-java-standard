@@ -204,9 +204,19 @@ public final class CloudTasksClientWrapper {
                     scheduleTimes.add(scheduleTimeHolder[0]);
                 }
 
+                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                com.google.protobuf.CodedOutputStream cos = com.google.protobuf.CodedOutputStream.newInstance(baos);
+                cos.writeString(1, parent.toString());
+                for (CreateTaskRequest req : requests) {
+                    cos.writeMessage(2, req);
+                }
+                cos.flush();
+                com.google.cloud.tasks.v2beta3.BatchCreateTasksRequest batchReq =
+                    com.google.cloud.tasks.v2beta3.BatchCreateTasksRequest.parseFrom(baos.toByteArray());
+
                 CompletableFuture<List<TaskHandle>> cf = new CompletableFuture<>();
                 com.google.api.gax.longrunning.OperationFuture<BatchCreateTasksResponse, BatchCreateTasksMetadata> batchFuture =
-                    client.batchCreateTasksAsync(parent, requests);
+                    client.batchCreateTasksAsync(batchReq);
                 ApiFutures.addCallback(batchFuture, new ApiFutureCallback<BatchCreateTasksResponse>() {
                     @Override
                     public void onSuccess(BatchCreateTasksResponse response) {
@@ -434,9 +444,19 @@ public final class CloudTasksClientWrapper {
                     taskNames.add(TaskName.of(projectId, location, effectiveQueue, handle.getName()).toString());
                 }
 
+                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                com.google.protobuf.CodedOutputStream cos = com.google.protobuf.CodedOutputStream.newInstance(baos);
+                cos.writeString(1, QueueName.of(projectId, location, effectiveQueue).toString());
+                for (String tName : taskNames) {
+                    cos.writeString(2, tName);
+                }
+                cos.flush();
+                com.google.cloud.tasks.v2beta3.BatchDeleteTasksRequest batchDeleteReq =
+                    com.google.cloud.tasks.v2beta3.BatchDeleteTasksRequest.parseFrom(baos.toByteArray());
+
                 CompletableFuture<List<Boolean>> cf = new CompletableFuture<>();
                 com.google.api.gax.longrunning.OperationFuture<com.google.protobuf.Empty, BatchDeleteTasksMetadata> batchFuture =
-                    client.batchDeleteTasksAsync(QueueName.of(projectId, location, effectiveQueue), taskNames);
+                    client.batchDeleteTasksAsync(batchDeleteReq);
                 ApiFutures.addCallback(batchFuture, new ApiFutureCallback<com.google.protobuf.Empty>() {
                     @Override
                     public void onSuccess(com.google.protobuf.Empty result) {
