@@ -60,13 +60,6 @@
       <systemPath>${project.basedir}/../api/lib/gax-2.78.0.jar</systemPath>
     </dependency>
     <dependency>
-      <groupId>com.google.protobuf</groupId>
-      <artifactId>protobuf-java</artifactId>
-      <version>4.33.4</version>
-      <scope>system</scope>
-      <systemPath>${project.basedir}/../api/lib/protobuf-java-4.33.4.jar</systemPath>
-    </dependency>
-    <dependency>
       <groupId>joda-time</groupId>
       <artifactId>joda-time</artifactId>
       <optional>true</optional>
