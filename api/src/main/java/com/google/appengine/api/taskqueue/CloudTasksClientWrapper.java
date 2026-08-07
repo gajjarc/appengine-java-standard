@@ -210,6 +210,7 @@ public final class CloudTasksClientWrapper {
                     taskNames.add(chosenName);
 
                     com.google.gson.JsonObject reqObj = new com.google.gson.JsonObject();
+                    reqObj.addProperty("parent", parent.toString());
                     reqObj.add("task", buildTaskJsonObject(parent.toString(), projectId, location, effectiveQueue, serviceName, options, chosenName));
                     requestsArr.add(reqObj);
                 }
