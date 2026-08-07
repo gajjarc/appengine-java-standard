@@ -205,12 +205,20 @@ public final class CloudTasksClientWrapper {
                 }
 
                 java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-                com.google.protobuf.CodedOutputStream cos = com.google.protobuf.CodedOutputStream.newInstance(baos);
-                cos.writeString(1, parent.toString());
-                for (CreateTaskRequest req : requests) {
-                    cos.writeMessage(2, req);
+                try {
+                    byte[] parentBytes = parent.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    baos.write(0x0A);
+                    writeVarint32(baos, parentBytes.length);
+                    baos.write(parentBytes);
+                    for (CreateTaskRequest req : requests) {
+                        byte[] reqBytes = req.toByteArray();
+                        baos.write(0x12);
+                        writeVarint32(baos, reqBytes.length);
+                        baos.write(reqBytes);
+                    }
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException("Failed to serialize BatchCreateTasksRequest", e);
                 }
-                cos.flush();
                 com.google.cloud.tasks.v2beta3.BatchCreateTasksRequest batchReq =
                     com.google.cloud.tasks.v2beta3.BatchCreateTasksRequest.parseFrom(baos.toByteArray());
 
@@ -445,12 +453,20 @@ public final class CloudTasksClientWrapper {
                 }
 
                 java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-                com.google.protobuf.CodedOutputStream cos = com.google.protobuf.CodedOutputStream.newInstance(baos);
-                cos.writeString(1, QueueName.of(projectId, location, effectiveQueue).toString());
-                for (String tName : taskNames) {
-                    cos.writeString(2, tName);
+                try {
+                    byte[] qNameBytes = QueueName.of(projectId, location, effectiveQueue).toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    baos.write(0x0A);
+                    writeVarint32(baos, qNameBytes.length);
+                    baos.write(qNameBytes);
+                    for (String tName : taskNames) {
+                        byte[] tNameBytes = tName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                        baos.write(0x12);
+                        writeVarint32(baos, tNameBytes.length);
+                        baos.write(tNameBytes);
+                    }
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException("Failed to serialize BatchDeleteTasksRequest", e);
                 }
-                cos.flush();
                 com.google.cloud.tasks.v2beta3.BatchDeleteTasksRequest batchDeleteReq =
                     com.google.cloud.tasks.v2beta3.BatchDeleteTasksRequest.parseFrom(baos.toByteArray());
 
@@ -759,5 +775,13 @@ public final class CloudTasksClientWrapper {
             logger.log(Level.SEVERE, "CLOUDTASK: Client SDK exception dispatching task " + taskName + ": " + e.getMessage(), e);
             return com.google.appengine.api.taskqueue_bytes.TaskQueuePb.TaskQueueServiceError.ErrorCode.INTERNAL_ERROR;
         }
+    }
+
+    private static void writeVarint32(java.io.OutputStream os, int value) throws java.io.IOException {
+        while ((value & ~0x7F) != 0) {
+            os.write((value & 0x7F) | 0x80);
+            value >>>= 7;
+        }
+        os.write(value & 0x7F);
     }
 }
