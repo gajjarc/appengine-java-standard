@@ -255,32 +255,38 @@ public final class CloudTasksClientWrapper {
 
             List<CompletableFuture<TaskHandle>> taskFutures = new ArrayList<>();
 
-            for (TaskOptions options : taskOptionsList) {
-                long[] scheduleTimeHolder = new long[1];
-                CreateTaskRequest req = buildCreateTaskRequest(
-                    parent, projectId, location, effectiveQueue, serviceName, options, scheduleTimeHolder);
+            String singleRestUrl = String.format(
+                "https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s/tasks",
+                projectId, location, effectiveQueue);
 
-                final long finalScheduleTimeMs = scheduleTimeHolder[0];
+            for (TaskOptions options : taskOptionsList) {
+                final long finalScheduleTimeMs = calculateScheduleTimeMs(options);
                 final String userTaskName = options.getTaskName();
+                String chosenName = (userTaskName != null && !userTaskName.isEmpty())
+                    ? userTaskName : "task-" + UUID.randomUUID();
+
+                com.google.gson.JsonObject createBody = new com.google.gson.JsonObject();
+                createBody.add("task", buildTaskJsonObject(parent.toString(), projectId, location, effectiveQueue, serviceName, options, chosenName));
 
                 CompletableFuture<TaskHandle> cf = new CompletableFuture<>();
-                ApiFuture<Task> apiFuture = client.createTaskCallable().futureCall(req);
-                ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Task>() {
-                    @Override
-                    public void onSuccess(Task createdTask) {
-                        String chosenTaskName = TaskName.parse(createdTask.getName()).getTask();
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        String jsonResp = makeRestPost(singleRestUrl, createBody.toString());
+                        com.google.gson.JsonObject respObj = com.google.gson.JsonParser.parseString(jsonResp).getAsJsonObject();
+                        String assignedName = chosenName;
+                        if (respObj.has("name")) {
+                            String fullName = respObj.get("name").getAsString();
+                            assignedName = fullName.substring(fullName.lastIndexOf('/') + 1);
+                        }
                         TaskOptions handleOptions = new TaskOptions(options);
-                        handleOptions.taskName(chosenTaskName);
+                        handleOptions.taskName(assignedName);
                         TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
                         handle.etaUsec(finalScheduleTimeMs * 1000L);
                         cf.complete(handle);
-                    }
-
-                    @Override
-                    public void onFailure(Throwable t) {
+                    } catch (Throwable t) {
                         cf.completeExceptionally(handleCreateTaskError(t, userTaskName, effectiveQueue));
                     }
-                }, MoreExecutors.directExecutor());
+                });
 
                 taskFutures.add(cf);
             }
@@ -479,23 +485,20 @@ public final class CloudTasksClientWrapper {
 
             List<CompletableFuture<Boolean>> futures = new ArrayList<>();
             for (TaskHandle handle : taskHandles) {
-                TaskName taskName = TaskName.of(projectId, location, effectiveQueue, handle.getName());
-                DeleteTaskRequest req = DeleteTaskRequest.newBuilder().setName(taskName.toString()).build();
+                String singleDeleteUrl = String.format(
+                    "https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s/tasks/%s",
+                    projectId, location, effectiveQueue, handle.getName());
 
                 CompletableFuture<Boolean> cf = new CompletableFuture<>();
-                ApiFuture<?> apiFuture = client.deleteTaskCallable().futureCall(req);
-                ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Object>() {
-                    @Override
-                    public void onSuccess(Object result) {
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        makeRestDelete(singleDeleteUrl);
                         cf.complete(Boolean.TRUE);
-                    }
-
-                    @Override
-                    public void onFailure(Throwable t) {
-                        logger.log(Level.WARNING, "Failed to delete Cloud Task via Client SDK: " + taskName, t);
+                    } catch (Throwable t) {
+                        logger.log(Level.WARNING, "Failed to delete Cloud Task via REST API: " + handle.getName(), t);
                         cf.complete(Boolean.FALSE);
                     }
-                }, MoreExecutors.directExecutor());
+                });
                 futures.add(cf);
             }
 
@@ -505,7 +508,7 @@ public final class CloudTasksClientWrapper {
             }
             return CompletableFuture.completedFuture(results);
         } catch (Exception e) {
-            logger.log(Level.SEVERE, "Failed to initialize CloudTasksClient for delete", e);
+            logger.log(Level.SEVERE, "Failed to delete Cloud Tasks via REST API", e);
             List<Boolean> results = new ArrayList<>();
             for (int i = 0; i < taskHandles.size(); i++) results.add(Boolean.FALSE);
             return CompletableFuture.completedFuture(results);
@@ -900,6 +903,28 @@ public final class CloudTasksClientWrapper {
             java.io.InputStream err = conn.getErrorStream();
             String errText = (err != null) ? new String(err.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8) : "";
             throw new RuntimeException("REST GET request to " + urlString + " failed with HTTP " + code + ": " + errText);
+        }
+
+        java.io.InputStream is = conn.getInputStream();
+        return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private static String makeRestDelete(String urlString) throws Exception {
+        com.google.appengine.api.appidentity.AppIdentityService appIdentityService =
+            com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
+        com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
+            appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
+
+        java.net.URL url = new java.net.URL(urlString);
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("DELETE");
+        conn.setRequestProperty("Authorization", "Bearer " + tokenResult.getAccessToken());
+
+        int code = conn.getResponseCode();
+        if (code < 200 || code >= 300) {
+            java.io.InputStream err = conn.getErrorStream();
+            String errText = (err != null) ? new String(err.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8) : "";
+            throw new RuntimeException("REST DELETE request to " + urlString + " failed with HTTP " + code + ": " + errText);
         }
 
         java.io.InputStream is = conn.getInputStream();
