@@ -523,49 +523,68 @@ public final class CloudTasksClientWrapper {
         String projectId = TaskProcessor.getProjectId();
         String location = TaskProcessor.getLocation();
 
-        try {
-            CloudTasksClient client = getClient();
-            GetQueueRequest request = GetQueueRequest.newBuilder()
-                .setName(QueueName.of(projectId, location, effectiveQueue).toString())
-                .setReadMask(FieldMask.newBuilder().addPaths("stats").build())
-                .build();
+        String restUrl = String.format(
+            "https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s?readMask=stats",
+            projectId, location, effectiveQueue);
 
-            Queue queue = client.getQueue(request);
-            QueueStats stats = queue.getStats();
+        CompletableFuture<QueueStatistics> cf = new CompletableFuture<>();
+        CompletableFuture.runAsync(() -> {
+            try {
+                String jsonResp = makeRestGet(restUrl);
+                com.google.gson.JsonObject queueObj = com.google.gson.JsonParser.parseString(jsonResp).getAsJsonObject();
 
-            int tasksCount = (int) stats.getTasksCount();
-            long oldestEtaUsec = 0;
-            if (stats.hasOldestEstimatedArrivalTime()) {
-                Timestamp oldest = stats.getOldestEstimatedArrivalTime();
-                oldestEtaUsec = oldest.getSeconds() * 1_000_000L + oldest.getNanos() / 1000L;
+                int tasksCount = 0;
+                long oldestEtaUsec = 0;
+                int executedLastMinute = 0;
+                int requestsInFlight = 0;
+                double enforcedRate = 0.0;
+
+                if (queueObj.has("stats")) {
+                    com.google.gson.JsonObject statsObj = queueObj.getAsJsonObject("stats");
+                    if (statsObj.has("tasksCount")) {
+                        tasksCount = statsObj.get("tasksCount").getAsInt();
+                    }
+                    if (statsObj.has("oldestEstimatedArrivalTime")) {
+                        String isoTime = statsObj.get("oldestEstimatedArrivalTime").getAsString();
+                        java.time.Instant instant = java.time.Instant.parse(isoTime);
+                        oldestEtaUsec = instant.getEpochSecond() * 1_000_000L + instant.getNano() / 1000L;
+                    }
+                    if (statsObj.has("executedLastMinuteCount")) {
+                        executedLastMinute = statsObj.get("executedLastMinuteCount").getAsInt();
+                    }
+                    if (statsObj.has("concurrentDispatchesCount")) {
+                        requestsInFlight = statsObj.get("concurrentDispatchesCount").getAsInt();
+                    }
+                    if (statsObj.has("effectiveExecutionRate")) {
+                        enforcedRate = statsObj.get("effectiveExecutionRate").getAsDouble();
+                    }
+                }
+
+                TaskQueueFetchQueueStatsResponse.QueueStats.Builder legacyStatsBuilder =
+                    TaskQueueFetchQueueStatsResponse.QueueStats.newBuilder();
+                legacyStatsBuilder.setNumTasks(tasksCount);
+                legacyStatsBuilder.setOldestEtaUsec(oldestEtaUsec);
+
+                TaskQueueScannerQueueInfo.Builder scannerInfoBuilder = TaskQueueScannerQueueInfo.newBuilder();
+                scannerInfoBuilder.setExecutedLastMinute(executedLastMinute);
+                scannerInfoBuilder.setExecutedLastHour(0);
+                scannerInfoBuilder.setRequestsInFlight(requestsInFlight);
+                scannerInfoBuilder.setEnforcedRate(enforcedRate);
+                scannerInfoBuilder.setSamplingDurationSeconds(60.0);
+                legacyStatsBuilder.setScannerInfo(scannerInfoBuilder);
+
+                QueueStatistics queueStats = new QueueStatistics(effectiveQueue, legacyStatsBuilder.build());
+                cf.complete(queueStats);
+            } catch (Throwable t) {
+                logger.log(Level.SEVERE, "CLOUDTASK: Failed to fetch stats for queue " + effectiveQueue + " via REST API: " + t.getMessage(), t);
+                cf.completeExceptionally(new RuntimeException("CLOUDTASK_STATS_FAILED", t));
             }
-            int executedLastMinute = (int) stats.getExecutedLastMinuteCount();
-            int requestsInFlight = (int) stats.getConcurrentDispatchesCount();
-            double enforcedRate = stats.getEffectiveExecutionRate();
-
-            TaskQueueFetchQueueStatsResponse.QueueStats.Builder legacyStatsBuilder =
-                TaskQueueFetchQueueStatsResponse.QueueStats.newBuilder();
-            legacyStatsBuilder.setNumTasks(tasksCount);
-            legacyStatsBuilder.setOldestEtaUsec(oldestEtaUsec);
-
-            TaskQueueScannerQueueInfo.Builder scannerInfoBuilder = TaskQueueScannerQueueInfo.newBuilder();
-            scannerInfoBuilder.setExecutedLastMinute(executedLastMinute);
-            scannerInfoBuilder.setExecutedLastHour(0);
-            scannerInfoBuilder.setRequestsInFlight(requestsInFlight);
-            scannerInfoBuilder.setEnforcedRate(enforcedRate);
-            scannerInfoBuilder.setSamplingDurationSeconds(60.0);
-            legacyStatsBuilder.setScannerInfo(scannerInfoBuilder);
-
-            QueueStatistics queueStats = new QueueStatistics(effectiveQueue, legacyStatsBuilder.build());
-            return CompletableFuture.completedFuture(queueStats);
-        } catch (Exception e) {
-            logger.log(Level.SEVERE, "CLOUDTASK: Failed to fetch stats for queue " + effectiveQueue + " via Client SDK: " + e.getMessage(), e);
-            throw new RuntimeException("CLOUDTASK_STATS_FAILED", e);
-        }
+        });
+        return cf;
     }
 
     /**
-     * Purges all tasks from the specified Cloud Tasks queue using official Client SDK.
+     * Purges all tasks from the specified Cloud Tasks queue using REST API.
      *
      * @param queueName the short name of the target queue
      */
@@ -573,13 +592,15 @@ public final class CloudTasksClientWrapper {
         String effectiveQueue = (queueName == null || queueName.isEmpty()) ? "default" : queueName;
         String projectId = TaskProcessor.getProjectId();
         String location = TaskProcessor.getLocation();
-        QueueName parent = QueueName.of(projectId, location, effectiveQueue);
+
+        String restUrl = String.format(
+            "https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s:purge",
+            projectId, location, effectiveQueue);
 
         try {
-            CloudTasksClient client = getClient();
-            client.purgeQueue(parent);
+            makeRestPost(restUrl, "{}");
         } catch (Exception e) {
-            logger.log(Level.SEVERE, "CLOUDTASK: Failed to purge queue " + effectiveQueue + " via Client SDK: " + e.getMessage(), e);
+            logger.log(Level.SEVERE, "CLOUDTASK: Failed to purge queue " + effectiveQueue + " via REST API: " + e.getMessage(), e);
             throw new RuntimeException("CLOUDTASK_PURGE_FAILED", e);
         }
     }
@@ -861,5 +882,27 @@ public final class CloudTasksClientWrapper {
             }
         });
         return cf;
+    }
+
+    private static String makeRestGet(String urlString) throws Exception {
+        com.google.appengine.api.appidentity.AppIdentityService appIdentityService =
+            com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
+        com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
+            appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
+
+        java.net.URL url = new java.net.URL(urlString);
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("GET");
+        conn.setRequestProperty("Authorization", "Bearer " + tokenResult.getAccessToken());
+
+        int code = conn.getResponseCode();
+        if (code < 200 || code >= 300) {
+            java.io.InputStream err = conn.getErrorStream();
+            String errText = (err != null) ? new String(err.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8) : "";
+            throw new RuntimeException("REST GET request to " + urlString + " failed with HTTP " + code + ": " + errText);
+        }
+
+        java.io.InputStream is = conn.getInputStream();
+        return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
     }
 }
