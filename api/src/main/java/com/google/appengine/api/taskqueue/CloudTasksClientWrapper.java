@@ -603,15 +603,14 @@ public final class CloudTasksClientWrapper {
     private static boolean isUnknownQueue(Throwable t) {
         Throwable curr = t;
         while (curr != null) {
-            if (curr instanceof NotFoundException || curr instanceof InvalidArgumentException || curr instanceof FailedPreconditionException) return true;
+            if (curr instanceof NotFoundException) return true;
             if (curr instanceof ApiException) {
                 StatusCode.Code code = ((ApiException) curr).getStatusCode().getCode();
-                if (code == StatusCode.Code.NOT_FOUND || code == StatusCode.Code.FAILED_PRECONDITION || code == StatusCode.Code.INVALID_ARGUMENT) return true;
+                if (code == StatusCode.Code.NOT_FOUND) return true;
             }
             String clsName = curr.getClass().getName();
             String msg = curr.getMessage();
-            if (clsName.contains("NotFound") || clsName.contains("InvalidArgument") || clsName.contains("FailedPrecondition") ||
-                (msg != null && (msg.contains("Queue does not exist") || msg.contains("NOT_FOUND") || msg.contains("FAILED_PRECONDITION")))) {
+            if (clsName.contains("NotFound") || (msg != null && (msg.contains("Queue does not exist") || msg.contains("queue not found") || msg.contains("NOT_FOUND")))) {
                 return true;
             }
             curr = curr.getCause();
