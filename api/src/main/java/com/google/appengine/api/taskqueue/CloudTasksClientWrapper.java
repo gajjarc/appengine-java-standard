@@ -68,19 +68,34 @@ public final class CloudTasksClientWrapper {
 
     private CloudTasksClientWrapper() {}
 
+    private static volatile String cachedToken = null;
+    private static volatile long cachedTokenExpiry = 0;
+
     private static String getValidAccessToken() throws Exception {
+        long now = System.currentTimeMillis();
+        if (cachedToken != null && now < cachedTokenExpiry - 60000L) {
+            return cachedToken;
+        }
+
         try {
             com.google.appengine.api.appidentity.AppIdentityService appIdentityService =
                 com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
             com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
-                appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
+                appIdentityService.getAccessToken(java.util.Arrays.asList(
+                    "https://www.googleapis.com/auth/cloud-platform",
+                    "https://www.googleapis.com/auth/cloudtasks"));
             if (tokenResult != null && tokenResult.getAccessToken() != null) {
-                return tokenResult.getAccessToken();
+                cachedToken = tokenResult.getAccessToken();
+                cachedTokenExpiry = tokenResult.getExpirationTime() != null 
+                    ? tokenResult.getExpirationTime().getTime() 
+                    : (now + 3600_000L);
+                return cachedToken;
             }
         } catch (Throwable ignored) {}
 
         try {
-            java.net.URL url = new java.net.URL("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token");
+            java.net.URL url = new java.net.URL(
+                "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform");
             java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
             conn.setRequestProperty("Metadata-Flavor", "Google");
@@ -90,12 +105,20 @@ public final class CloudTasksClientWrapper {
                 java.io.InputStream is = conn.getInputStream();
                 String resp = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
                 com.google.gson.JsonObject obj = com.google.gson.JsonParser.parseString(resp).getAsJsonObject();
-                return obj.get("access_token").getAsString();
+                String token = obj.get("access_token").getAsString();
+                long expiresIn = obj.has("expires_in") ? obj.get("expires_in").getAsLong() : 3600L;
+                cachedToken = token;
+                cachedTokenExpiry = now + (expiresIn * 1000L);
+                return token;
             }
         } catch (Exception e) {
-            throw new java.io.IOException("Failed to refresh access token from Metadata server", e);
+            logger.log(Level.WARNING, "Failed to get access token from Metadata server: " + e.getMessage());
         }
-        throw new java.io.IOException("Unable to obtain access token");
+
+        if (cachedToken != null) {
+            return cachedToken;
+        }
+        throw new java.io.IOException("Unable to obtain access token from AppIdentityService or Metadata server");
     }
 
     private static CloudTasksClient getClient() {
@@ -108,7 +131,7 @@ public final class CloudTasksClientWrapper {
                             public com.google.auth.oauth2.AccessToken refreshAccessToken() throws java.io.IOException {
                                 try {
                                     String token = getValidAccessToken();
-                                    return new com.google.auth.oauth2.AccessToken(token, new java.util.Date(System.currentTimeMillis() + 3600_000L));
+                                    return new com.google.auth.oauth2.AccessToken(token, new java.util.Date(cachedTokenExpiry));
                                 } catch (Exception e) {
                                     throw new java.io.IOException("Failed to refresh access token", e);
                                 }
