@@ -68,6 +68,36 @@ public final class CloudTasksClientWrapper {
 
     private CloudTasksClientWrapper() {}
 
+    private static String getValidAccessToken() throws Exception {
+        try {
+            com.google.appengine.api.appidentity.AppIdentityService appIdentityService =
+                com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
+            com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
+                appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
+            if (tokenResult != null && tokenResult.getAccessToken() != null) {
+                return tokenResult.getAccessToken();
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            java.net.URL url = new java.net.URL("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token");
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("Metadata-Flavor", "Google");
+            conn.setConnectTimeout(2000);
+            conn.setReadTimeout(2000);
+            if (conn.getResponseCode() == 200) {
+                java.io.InputStream is = conn.getInputStream();
+                String resp = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                com.google.gson.JsonObject obj = com.google.gson.JsonParser.parseString(resp).getAsJsonObject();
+                return obj.get("access_token").getAsString();
+            }
+        } catch (Exception e) {
+            throw new java.io.IOException("Failed to refresh access token from Metadata server", e);
+        }
+        throw new java.io.IOException("Unable to obtain access token");
+    }
+
     private static CloudTasksClient getClient() {
         if (sharedClient == null) {
             synchronized (CloudTasksClientWrapper.class) {
@@ -77,35 +107,11 @@ public final class CloudTasksClientWrapper {
                             @Override
                             public com.google.auth.oauth2.AccessToken refreshAccessToken() throws java.io.IOException {
                                 try {
-                                    com.google.appengine.api.appidentity.AppIdentityService appIdentityService =
-                                        com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
-                                    com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
-                                        appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
-                                    if (tokenResult != null && tokenResult.getAccessToken() != null) {
-                                        return new com.google.auth.oauth2.AccessToken(tokenResult.getAccessToken(), tokenResult.getExpirationTime());
-                                    }
-                                } catch (Throwable ignored) {}
-
-                                try {
-                                    java.net.URL url = new java.net.URL("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token");
-                                    java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
-                                    conn.setRequestMethod("GET");
-                                    conn.setRequestProperty("Metadata-Flavor", "Google");
-                                    conn.setConnectTimeout(2000);
-                                    conn.setReadTimeout(2000);
-                                    if (conn.getResponseCode() == 200) {
-                                        java.io.InputStream is = conn.getInputStream();
-                                        String resp = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-                                        com.google.gson.JsonObject obj = com.google.gson.JsonParser.parseString(resp).getAsJsonObject();
-                                        String accessToken = obj.get("access_token").getAsString();
-                                        long expiresIn = obj.has("expires_in") ? obj.get("expires_in").getAsLong() : 3600L;
-                                        java.util.Date expiry = new java.util.Date(System.currentTimeMillis() + (expiresIn * 1000L));
-                                        return new com.google.auth.oauth2.AccessToken(accessToken, expiry);
-                                    }
+                                    String token = getValidAccessToken();
+                                    return new com.google.auth.oauth2.AccessToken(token, new java.util.Date(System.currentTimeMillis() + 3600_000L));
                                 } catch (Exception e) {
-                                    throw new java.io.IOException("Failed to refresh access token from Metadata server", e);
+                                    throw new java.io.IOException("Failed to refresh access token", e);
                                 }
-                                throw new java.io.IOException("Unable to refresh access token");
                             }
                         };
                         com.google.cloud.tasks.v2beta3.CloudTasksSettings settings =
@@ -833,15 +839,12 @@ public final class CloudTasksClientWrapper {
     }
 
     private static String makeRestPost(String urlString, String jsonBody) throws Exception {
-        com.google.appengine.api.appidentity.AppIdentityService appIdentityService =
-            com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
-        com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
-            appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
+        String token = getValidAccessToken();
 
         java.net.URL url = new java.net.URL(urlString);
         java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
         conn.setRequestMethod("POST");
-        conn.setRequestProperty("Authorization", "Bearer " + tokenResult.getAccessToken());
+        conn.setRequestProperty("Authorization", "Bearer " + token);
         conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
         conn.setDoOutput(true);
 
