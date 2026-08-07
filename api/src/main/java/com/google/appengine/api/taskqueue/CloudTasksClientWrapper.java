@@ -73,16 +73,23 @@ public final class CloudTasksClientWrapper {
             synchronized (CloudTasksClientWrapper.class) {
                 if (sharedClient == null) {
                     try {
-                        com.google.appengine.api.appidentity.AppIdentityService appIdentityService =
-                            com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
-                        com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
-                            appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
-                        com.google.api.gax.rpc.HeaderProvider headerProvider =
-                            com.google.api.gax.rpc.FixedHeaderProvider.create("Authorization", "Bearer " + tokenResult.getAccessToken());
+                        com.google.auth.Credentials credentials = new com.google.auth.oauth2.GoogleCredentials() {
+                            @Override
+                            public com.google.auth.oauth2.AccessToken refreshAccessToken() throws java.io.IOException {
+                                try {
+                                    com.google.appengine.api.appidentity.AppIdentityService appIdentityService =
+                                        com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
+                                    com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
+                                        appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
+                                    return new com.google.auth.oauth2.AccessToken(tokenResult.getAccessToken(), tokenResult.getExpirationTime());
+                                } catch (Exception e) {
+                                    throw new java.io.IOException("Failed to refresh access token via AppIdentityService", e);
+                                }
+                            }
+                        };
                         com.google.cloud.tasks.v2beta3.CloudTasksSettings settings =
                             com.google.cloud.tasks.v2beta3.CloudTasksSettings.newBuilder()
-                                .setCredentialsProvider(com.google.api.gax.core.NoCredentialsProvider.create())
-                                .setHeaderProvider(headerProvider)
+                                .setCredentialsProvider(com.google.api.gax.core.FixedCredentialsProvider.create(credentials))
                                 .build();
                         sharedClient = CloudTasksClient.create(settings);
                     } catch (Exception e) {
@@ -255,38 +262,32 @@ public final class CloudTasksClientWrapper {
 
             List<CompletableFuture<TaskHandle>> taskFutures = new ArrayList<>();
 
-            String singleRestUrl = String.format(
-                "https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s/tasks",
-                projectId, location, effectiveQueue);
-
             for (TaskOptions options : taskOptionsList) {
-                final long finalScheduleTimeMs = calculateScheduleTimeMs(options);
-                final String userTaskName = options.getTaskName();
-                String chosenName = (userTaskName != null && !userTaskName.isEmpty())
-                    ? userTaskName : "task-" + UUID.randomUUID();
+                long[] scheduleTimeHolder = new long[1];
+                CreateTaskRequest req = buildCreateTaskRequest(
+                    parent, projectId, location, effectiveQueue, serviceName, options, scheduleTimeHolder);
 
-                com.google.gson.JsonObject createBody = new com.google.gson.JsonObject();
-                createBody.add("task", buildTaskJsonObject(parent.toString(), projectId, location, effectiveQueue, serviceName, options, chosenName));
+                final long finalScheduleTimeMs = scheduleTimeHolder[0];
+                final String userTaskName = options.getTaskName();
 
                 CompletableFuture<TaskHandle> cf = new CompletableFuture<>();
-                CompletableFuture.runAsync(() -> {
-                    try {
-                        String jsonResp = makeRestPost(singleRestUrl, createBody.toString());
-                        com.google.gson.JsonObject respObj = com.google.gson.JsonParser.parseString(jsonResp).getAsJsonObject();
-                        String assignedName = chosenName;
-                        if (respObj.has("name")) {
-                            String fullName = respObj.get("name").getAsString();
-                            assignedName = fullName.substring(fullName.lastIndexOf('/') + 1);
-                        }
+                ApiFuture<Task> apiFuture = client.createTaskCallable().futureCall(req);
+                ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Task>() {
+                    @Override
+                    public void onSuccess(Task createdTask) {
+                        String chosenTaskName = TaskName.parse(createdTask.getName()).getTask();
                         TaskOptions handleOptions = new TaskOptions(options);
-                        handleOptions.taskName(assignedName);
+                        handleOptions.taskName(chosenTaskName);
                         TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
                         handle.etaUsec(finalScheduleTimeMs * 1000L);
                         cf.complete(handle);
-                    } catch (Throwable t) {
+                    }
+
+                    @Override
+                    public void onFailure(Throwable t) {
                         cf.completeExceptionally(handleCreateTaskError(t, userTaskName, effectiveQueue));
                     }
-                });
+                }, MoreExecutors.directExecutor());
 
                 taskFutures.add(cf);
             }
@@ -485,20 +486,23 @@ public final class CloudTasksClientWrapper {
 
             List<CompletableFuture<Boolean>> futures = new ArrayList<>();
             for (TaskHandle handle : taskHandles) {
-                String singleDeleteUrl = String.format(
-                    "https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s/tasks/%s",
-                    projectId, location, effectiveQueue, handle.getName());
+                TaskName taskName = TaskName.of(projectId, location, effectiveQueue, handle.getName());
+                DeleteTaskRequest req = DeleteTaskRequest.newBuilder().setName(taskName.toString()).build();
 
                 CompletableFuture<Boolean> cf = new CompletableFuture<>();
-                CompletableFuture.runAsync(() -> {
-                    try {
-                        makeRestDelete(singleDeleteUrl);
+                ApiFuture<?> apiFuture = client.deleteTaskCallable().futureCall(req);
+                ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Object>() {
+                    @Override
+                    public void onSuccess(Object result) {
                         cf.complete(Boolean.TRUE);
-                    } catch (Throwable t) {
-                        logger.log(Level.WARNING, "Failed to delete Cloud Task via REST API: " + handle.getName(), t);
+                    }
+
+                    @Override
+                    public void onFailure(Throwable t) {
+                        logger.log(Level.WARNING, "Failed to delete Cloud Task via Client SDK: " + taskName, t);
                         cf.complete(Boolean.FALSE);
                     }
-                });
+                }, MoreExecutors.directExecutor());
                 futures.add(cf);
             }
 
@@ -508,7 +512,7 @@ public final class CloudTasksClientWrapper {
             }
             return CompletableFuture.completedFuture(results);
         } catch (Exception e) {
-            logger.log(Level.SEVERE, "Failed to delete Cloud Tasks via REST API", e);
+            logger.log(Level.SEVERE, "Failed to initialize CloudTasksClient for delete", e);
             List<Boolean> results = new ArrayList<>();
             for (int i = 0; i < taskHandles.size(); i++) results.add(Boolean.FALSE);
             return CompletableFuture.completedFuture(results);
@@ -526,68 +530,49 @@ public final class CloudTasksClientWrapper {
         String projectId = TaskProcessor.getProjectId();
         String location = TaskProcessor.getLocation();
 
-        String restUrl = String.format(
-            "https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s?readMask=stats",
-            projectId, location, effectiveQueue);
+        try {
+            CloudTasksClient client = getClient();
+            GetQueueRequest request = GetQueueRequest.newBuilder()
+                .setName(QueueName.of(projectId, location, effectiveQueue).toString())
+                .setReadMask(FieldMask.newBuilder().addPaths("stats").build())
+                .build();
 
-        CompletableFuture<QueueStatistics> cf = new CompletableFuture<>();
-        CompletableFuture.runAsync(() -> {
-            try {
-                String jsonResp = makeRestGet(restUrl);
-                com.google.gson.JsonObject queueObj = com.google.gson.JsonParser.parseString(jsonResp).getAsJsonObject();
+            Queue queue = client.getQueue(request);
+            QueueStats stats = queue.getStats();
 
-                int tasksCount = 0;
-                long oldestEtaUsec = 0;
-                int executedLastMinute = 0;
-                int requestsInFlight = 0;
-                double enforcedRate = 0.0;
-
-                if (queueObj.has("stats")) {
-                    com.google.gson.JsonObject statsObj = queueObj.getAsJsonObject("stats");
-                    if (statsObj.has("tasksCount")) {
-                        tasksCount = statsObj.get("tasksCount").getAsInt();
-                    }
-                    if (statsObj.has("oldestEstimatedArrivalTime")) {
-                        String isoTime = statsObj.get("oldestEstimatedArrivalTime").getAsString();
-                        java.time.Instant instant = java.time.Instant.parse(isoTime);
-                        oldestEtaUsec = instant.getEpochSecond() * 1_000_000L + instant.getNano() / 1000L;
-                    }
-                    if (statsObj.has("executedLastMinuteCount")) {
-                        executedLastMinute = statsObj.get("executedLastMinuteCount").getAsInt();
-                    }
-                    if (statsObj.has("concurrentDispatchesCount")) {
-                        requestsInFlight = statsObj.get("concurrentDispatchesCount").getAsInt();
-                    }
-                    if (statsObj.has("effectiveExecutionRate")) {
-                        enforcedRate = statsObj.get("effectiveExecutionRate").getAsDouble();
-                    }
-                }
-
-                TaskQueueFetchQueueStatsResponse.QueueStats.Builder legacyStatsBuilder =
-                    TaskQueueFetchQueueStatsResponse.QueueStats.newBuilder();
-                legacyStatsBuilder.setNumTasks(tasksCount);
-                legacyStatsBuilder.setOldestEtaUsec(oldestEtaUsec);
-
-                TaskQueueScannerQueueInfo.Builder scannerInfoBuilder = TaskQueueScannerQueueInfo.newBuilder();
-                scannerInfoBuilder.setExecutedLastMinute(executedLastMinute);
-                scannerInfoBuilder.setExecutedLastHour(0);
-                scannerInfoBuilder.setRequestsInFlight(requestsInFlight);
-                scannerInfoBuilder.setEnforcedRate(enforcedRate);
-                scannerInfoBuilder.setSamplingDurationSeconds(60.0);
-                legacyStatsBuilder.setScannerInfo(scannerInfoBuilder);
-
-                QueueStatistics queueStats = new QueueStatistics(effectiveQueue, legacyStatsBuilder.build());
-                cf.complete(queueStats);
-            } catch (Throwable t) {
-                logger.log(Level.SEVERE, "CLOUDTASK: Failed to fetch stats for queue " + effectiveQueue + " via REST API: " + t.getMessage(), t);
-                cf.completeExceptionally(new RuntimeException("CLOUDTASK_STATS_FAILED", t));
+            int tasksCount = (int) stats.getTasksCount();
+            long oldestEtaUsec = 0;
+            if (stats.hasOldestEstimatedArrivalTime()) {
+                Timestamp oldest = stats.getOldestEstimatedArrivalTime();
+                oldestEtaUsec = oldest.getSeconds() * 1_000_000L + oldest.getNanos() / 1000L;
             }
-        });
-        return cf;
+            int executedLastMinute = (int) stats.getExecutedLastMinuteCount();
+            int requestsInFlight = (int) stats.getConcurrentDispatchesCount();
+            double enforcedRate = stats.getEffectiveExecutionRate();
+
+            TaskQueueFetchQueueStatsResponse.QueueStats.Builder legacyStatsBuilder =
+                TaskQueueFetchQueueStatsResponse.QueueStats.newBuilder();
+            legacyStatsBuilder.setNumTasks(tasksCount);
+            legacyStatsBuilder.setOldestEtaUsec(oldestEtaUsec);
+
+            TaskQueueScannerQueueInfo.Builder scannerInfoBuilder = TaskQueueScannerQueueInfo.newBuilder();
+            scannerInfoBuilder.setExecutedLastMinute(executedLastMinute);
+            scannerInfoBuilder.setExecutedLastHour(0);
+            scannerInfoBuilder.setRequestsInFlight(requestsInFlight);
+            scannerInfoBuilder.setEnforcedRate(enforcedRate);
+            scannerInfoBuilder.setSamplingDurationSeconds(60.0);
+            legacyStatsBuilder.setScannerInfo(scannerInfoBuilder);
+
+            QueueStatistics queueStats = new QueueStatistics(effectiveQueue, legacyStatsBuilder.build());
+            return CompletableFuture.completedFuture(queueStats);
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "CLOUDTASK: Failed to fetch stats for queue " + effectiveQueue + " via Client SDK: " + e.getMessage(), e);
+            throw new RuntimeException("CLOUDTASK_STATS_FAILED", e);
+        }
     }
 
     /**
-     * Purges all tasks from the specified Cloud Tasks queue using REST API.
+     * Purges all tasks from the specified Cloud Tasks queue using official Client SDK.
      *
      * @param queueName the short name of the target queue
      */
@@ -595,15 +580,13 @@ public final class CloudTasksClientWrapper {
         String effectiveQueue = (queueName == null || queueName.isEmpty()) ? "default" : queueName;
         String projectId = TaskProcessor.getProjectId();
         String location = TaskProcessor.getLocation();
-
-        String restUrl = String.format(
-            "https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s:purge",
-            projectId, location, effectiveQueue);
+        QueueName parent = QueueName.of(projectId, location, effectiveQueue);
 
         try {
-            makeRestPost(restUrl, "{}");
+            CloudTasksClient client = getClient();
+            client.purgeQueue(parent);
         } catch (Exception e) {
-            logger.log(Level.SEVERE, "CLOUDTASK: Failed to purge queue " + effectiveQueue + " via REST API: " + e.getMessage(), e);
+            logger.log(Level.SEVERE, "CLOUDTASK: Failed to purge queue " + effectiveQueue + " via Client SDK: " + e.getMessage(), e);
             throw new RuntimeException("CLOUDTASK_PURGE_FAILED", e);
         }
     }
@@ -885,49 +868,5 @@ public final class CloudTasksClientWrapper {
             }
         });
         return cf;
-    }
-
-    private static String makeRestGet(String urlString) throws Exception {
-        com.google.appengine.api.appidentity.AppIdentityService appIdentityService =
-            com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
-        com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
-            appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
-
-        java.net.URL url = new java.net.URL(urlString);
-        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
-        conn.setRequestMethod("GET");
-        conn.setRequestProperty("Authorization", "Bearer " + tokenResult.getAccessToken());
-
-        int code = conn.getResponseCode();
-        if (code < 200 || code >= 300) {
-            java.io.InputStream err = conn.getErrorStream();
-            String errText = (err != null) ? new String(err.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8) : "";
-            throw new RuntimeException("REST GET request to " + urlString + " failed with HTTP " + code + ": " + errText);
-        }
-
-        java.io.InputStream is = conn.getInputStream();
-        return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-    }
-
-    private static String makeRestDelete(String urlString) throws Exception {
-        com.google.appengine.api.appidentity.AppIdentityService appIdentityService =
-            com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
-        com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
-            appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
-
-        java.net.URL url = new java.net.URL(urlString);
-        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
-        conn.setRequestMethod("DELETE");
-        conn.setRequestProperty("Authorization", "Bearer " + tokenResult.getAccessToken());
-
-        int code = conn.getResponseCode();
-        if (code < 200 || code >= 300) {
-            java.io.InputStream err = conn.getErrorStream();
-            String errText = (err != null) ? new String(err.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8) : "";
-            throw new RuntimeException("REST DELETE request to " + urlString + " failed with HTTP " + code + ": " + errText);
-        }
-
-        java.io.InputStream is = conn.getInputStream();
-        return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
     }
 }
