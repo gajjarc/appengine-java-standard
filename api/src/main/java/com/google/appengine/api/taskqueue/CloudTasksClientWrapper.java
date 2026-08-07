@@ -195,59 +195,59 @@ public final class CloudTasksClientWrapper {
         try {
             CloudTasksClient client = getClient();
             if (taskOptionsList.size() > 1) {
-                List<CreateTaskRequest> requests = new ArrayList<>();
+                com.google.gson.JsonObject batchBody = new com.google.gson.JsonObject();
+                com.google.gson.JsonArray requestsArr = new com.google.gson.JsonArray();
                 List<Long> scheduleTimes = new ArrayList<>();
-                for (TaskOptions options : taskOptionsList) {
-                    long[] scheduleTimeHolder = new long[1];
-                    requests.add(buildCreateTaskRequest(
-                        parent, projectId, location, effectiveQueue, serviceName, options, scheduleTimeHolder));
-                    scheduleTimes.add(scheduleTimeHolder[0]);
-                }
+                List<String> taskNames = new ArrayList<>();
 
-                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-                try {
-                    byte[] parentBytes = parent.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                    baos.write(0x0A);
-                    writeVarint32(baos, parentBytes.length);
-                    baos.write(parentBytes);
-                    for (CreateTaskRequest req : requests) {
-                        byte[] reqBytes = req.toByteArray();
-                        baos.write(0x12);
-                        writeVarint32(baos, reqBytes.length);
-                        baos.write(reqBytes);
-                    }
-                } catch (java.io.IOException e) {
-                    throw new RuntimeException("Failed to serialize BatchCreateTasksRequest", e);
+                for (TaskOptions options : taskOptionsList) {
+                    long scheduleTimeMs = calculateScheduleTimeMs(options);
+                    scheduleTimes.add(scheduleTimeMs);
+
+                    String userTaskName = options.getTaskName();
+                    String chosenName = (userTaskName != null && !userTaskName.isEmpty())
+                        ? userTaskName : "task-" + UUID.randomUUID();
+                    taskNames.add(chosenName);
+
+                    com.google.gson.JsonObject reqObj = new com.google.gson.JsonObject();
+                    reqObj.add("task", buildTaskJsonObject(parent.toString(), projectId, location, effectiveQueue, serviceName, options, chosenName));
+                    requestsArr.add(reqObj);
                 }
-                com.google.cloud.tasks.v2beta3.BatchCreateTasksRequest batchReq =
-                    com.google.cloud.tasks.v2beta3.BatchCreateTasksRequest.parseFrom(baos.toByteArray());
+                batchBody.add("requests", requestsArr);
+
+                String restUrl = String.format(
+                    "https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s/tasks:batchCreate",
+                    projectId, location, effectiveQueue);
 
                 CompletableFuture<List<TaskHandle>> cf = new CompletableFuture<>();
-                com.google.api.gax.longrunning.OperationFuture<BatchCreateTasksResponse, BatchCreateTasksMetadata> batchFuture =
-                    client.batchCreateTasksAsync(batchReq);
-                ApiFutures.addCallback(batchFuture, new ApiFutureCallback<BatchCreateTasksResponse>() {
-                    @Override
-                    public void onSuccess(BatchCreateTasksResponse response) {
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        String jsonResp = makeRestPost(restUrl, batchBody.toString());
+                        com.google.gson.JsonObject respObj = com.google.gson.JsonParser.parseString(jsonResp).getAsJsonObject();
+                        com.google.gson.JsonArray createdTasksArr = respObj.getAsJsonArray("tasks");
+
                         List<TaskHandle> createdHandles = new ArrayList<>();
-                        List<Task> createdTasks = response.getTasksList();
-                        for (int i = 0; i < createdTasks.size(); i++) {
-                            Task createdTask = createdTasks.get(i);
+                        for (int i = 0; i < taskOptionsList.size(); i++) {
                             TaskOptions options = taskOptionsList.get(i);
-                            String chosenTaskName = TaskName.parse(createdTask.getName()).getTask();
+                            String assignedName = taskNames.get(i);
+                            if (createdTasksArr != null && i < createdTasksArr.size()) {
+                                com.google.gson.JsonObject tObj = createdTasksArr.get(i).getAsJsonObject();
+                                if (tObj.has("name")) {
+                                    String fullName = tObj.get("name").getAsString();
+                                    assignedName = fullName.substring(fullName.lastIndexOf('/') + 1);
+                                }
+                            }
                             TaskOptions handleOptions = new TaskOptions(options);
-                            handleOptions.taskName(chosenTaskName);
+                            handleOptions.taskName(assignedName);
                             TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
                             handle.etaUsec(scheduleTimes.get(i) * 1000L);
                             createdHandles.add(handle);
                         }
                         cf.complete(createdHandles);
-                    }
-
-                    @Override
-                    public void onFailure(Throwable t) {
+                    } catch (Throwable t) {
                         cf.completeExceptionally(handleCreateTaskError(t, null, effectiveQueue));
                     }
-                }, MoreExecutors.directExecutor());
+                });
 
                 return cf;
             }
@@ -447,48 +447,31 @@ public final class CloudTasksClientWrapper {
         try {
             CloudTasksClient client = getClient();
             if (taskHandles.size() > 1) {
-                List<String> taskNames = new ArrayList<>();
+                com.google.gson.JsonObject batchDeleteBody = new com.google.gson.JsonObject();
+                com.google.gson.JsonArray namesArr = new com.google.gson.JsonArray();
                 for (TaskHandle handle : taskHandles) {
-                    taskNames.add(TaskName.of(projectId, location, effectiveQueue, handle.getName()).toString());
+                    namesArr.add(TaskName.of(projectId, location, effectiveQueue, handle.getName()).toString());
                 }
+                batchDeleteBody.add("names", namesArr);
 
-                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-                try {
-                    byte[] qNameBytes = QueueName.of(projectId, location, effectiveQueue).toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                    baos.write(0x0A);
-                    writeVarint32(baos, qNameBytes.length);
-                    baos.write(qNameBytes);
-                    for (String tName : taskNames) {
-                        byte[] tNameBytes = tName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                        baos.write(0x12);
-                        writeVarint32(baos, tNameBytes.length);
-                        baos.write(tNameBytes);
-                    }
-                } catch (java.io.IOException e) {
-                    throw new RuntimeException("Failed to serialize BatchDeleteTasksRequest", e);
-                }
-                com.google.cloud.tasks.v2beta3.BatchDeleteTasksRequest batchDeleteReq =
-                    com.google.cloud.tasks.v2beta3.BatchDeleteTasksRequest.parseFrom(baos.toByteArray());
+                String restUrl = String.format(
+                    "https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s/tasks:batchDelete",
+                    projectId, location, effectiveQueue);
 
                 CompletableFuture<List<Boolean>> cf = new CompletableFuture<>();
-                com.google.api.gax.longrunning.OperationFuture<com.google.protobuf.Empty, BatchDeleteTasksMetadata> batchFuture =
-                    client.batchDeleteTasksAsync(batchDeleteReq);
-                ApiFutures.addCallback(batchFuture, new ApiFutureCallback<com.google.protobuf.Empty>() {
-                    @Override
-                    public void onSuccess(com.google.protobuf.Empty result) {
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        makeRestPost(restUrl, batchDeleteBody.toString());
                         List<Boolean> results = new ArrayList<>();
                         for (int i = 0; i < taskHandles.size(); i++) results.add(Boolean.TRUE);
                         cf.complete(results);
-                    }
-
-                    @Override
-                    public void onFailure(Throwable t) {
-                        logger.log(Level.WARNING, "Failed to batch delete Cloud Tasks via Client SDK", t);
+                    } catch (Throwable t) {
+                        logger.log(Level.WARNING, "Failed to batch delete Cloud Tasks via REST API", t);
                         List<Boolean> results = new ArrayList<>();
                         for (int i = 0; i < taskHandles.size(); i++) results.add(Boolean.FALSE);
                         cf.complete(results);
                     }
-                }, MoreExecutors.directExecutor());
+                });
 
                 return cf;
             }
@@ -777,11 +760,106 @@ public final class CloudTasksClientWrapper {
         }
     }
 
-    private static void writeVarint32(java.io.OutputStream os, int value) throws java.io.IOException {
-        while ((value & ~0x7F) != 0) {
-            os.write((value & 0x7F) | 0x80);
-            value >>>= 7;
+    private static com.google.gson.JsonObject buildTaskJsonObject(
+            String parent, String projectId, String location, String queueName, String serviceName, TaskOptions options, String chosenName) {
+        com.google.gson.JsonObject taskObj = new com.google.gson.JsonObject();
+        taskObj.addProperty("name", parent + "/tasks/" + chosenName);
+
+        com.google.gson.JsonObject httpReq = new com.google.gson.JsonObject();
+        httpReq.addProperty("relativeUri", options.getUrl() != null && !options.getUrl().isEmpty() ? options.getUrl() : "/");
+
+        com.google.gson.JsonObject routing = new com.google.gson.JsonObject();
+        routing.addProperty("service", serviceName);
+        httpReq.add("appEngineRouting", routing);
+
+        byte[] payload = options.getPayload();
+        if (payload != null && payload.length > 0) {
+            httpReq.addProperty("body", java.util.Base64.getEncoder().encodeToString(payload));
         }
-        os.write(value & 0x7F);
+
+        com.google.gson.JsonObject headersObj = new com.google.gson.JsonObject();
+        for (Map.Entry<String, List<String>> entry : options.getHeaders().entrySet()) {
+            if (!entry.getValue().isEmpty()) {
+                headersObj.addProperty(entry.getKey(), entry.getValue().get(0));
+            }
+        }
+        if (options.getRetryOptions() != null) {
+            if (options.getRetryOptions().getTaskRetryLimit() != null) {
+                headersObj.addProperty("X-Task-Retry-Limit", String.valueOf(options.getRetryOptions().getTaskRetryLimit()));
+            }
+            if (options.getRetryOptions().getTaskAgeLimitSeconds() != null) {
+                headersObj.addProperty("X-Task-Age-Limit-Seconds", String.valueOf(options.getRetryOptions().getTaskAgeLimitSeconds()));
+            }
+        }
+        httpReq.add("headers", headersObj);
+
+        taskObj.add("appEngineHttpRequest", httpReq);
+
+        long scheduleTimeMs = calculateScheduleTimeMs(options);
+        if (isDelayed(options) && scheduleTimeMs > System.currentTimeMillis() + 100L) {
+            java.time.Instant instant = java.time.Instant.ofEpochMilli(scheduleTimeMs);
+            taskObj.addProperty("scheduleTime", instant.toString());
+        }
+
+        return taskObj;
+    }
+
+    private static String makeRestPost(String urlString, String jsonBody) throws Exception {
+        com.google.appengine.api.appidentity.AppIdentityService appIdentityService =
+            com.google.appengine.api.appidentity.AppIdentityServiceFactory.getAppIdentityService();
+        com.google.appengine.api.appidentity.AppIdentityService.GetAccessTokenResult tokenResult =
+            appIdentityService.getAccessToken(java.util.Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"));
+
+        java.net.URL url = new java.net.URL(urlString);
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Authorization", "Bearer " + tokenResult.getAccessToken());
+        conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+        conn.setDoOutput(true);
+
+        if (jsonBody != null && !jsonBody.isEmpty()) {
+            try (java.io.OutputStream os = conn.getOutputStream()) {
+                os.write(jsonBody.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+        }
+
+        int code = conn.getResponseCode();
+        if (code < 200 || code >= 300) {
+            java.io.InputStream err = conn.getErrorStream();
+            String errText = (err != null) ? new String(err.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8) : "";
+            throw new RuntimeException("REST API request to " + urlString + " failed with HTTP " + code + ": " + errText);
+        }
+
+        java.io.InputStream is = conn.getInputStream();
+        return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Executes a task force-run / retry via REST API.
+     *
+     * @param queueName the queue name
+     * @param taskName the task name
+     * @return a {@link Future} resolving to true if successful
+     */
+    public static Future<Boolean> runTaskAsync(String queueName, String taskName) {
+        String effectiveQueue = (queueName == null || queueName.isEmpty()) ? "default" : queueName;
+        String projectId = TaskProcessor.getProjectId();
+        String location = TaskProcessor.getLocation();
+
+        String restUrl = String.format(
+            "https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s/tasks/%s:run",
+            projectId, location, effectiveQueue, taskName);
+
+        CompletableFuture<Boolean> cf = new CompletableFuture<>();
+        CompletableFuture.runAsync(() -> {
+            try {
+                makeRestPost(restUrl, "{}");
+                cf.complete(Boolean.TRUE);
+            } catch (Throwable t) {
+                logger.log(Level.WARNING, "Failed to run/retry task via REST API: " + taskName, t);
+                cf.complete(Boolean.FALSE);
+            }
+        });
+        return cf;
     }
 }
