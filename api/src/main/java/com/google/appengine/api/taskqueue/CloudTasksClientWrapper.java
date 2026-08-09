@@ -313,33 +313,70 @@ public final class CloudTasksClientWrapper {
             List<CompletableFuture<TaskHandle>> taskFutures = new ArrayList<>();
 
             for (TaskOptions options : taskOptionsList) {
-                long[] scheduleTimeHolder = new long[1];
-                CreateTaskRequest req = buildCreateTaskRequest(
-                    parent, projectId, location, effectiveQueue, serviceName, options, scheduleTimeHolder);
+                long scheduleTimeMs = calculateScheduleTimeMs(options);
+                String userTaskName = options.getTaskName();
 
-                final long finalScheduleTimeMs = scheduleTimeHolder[0];
-                final String userTaskName = options.getTaskName();
+                if (options.getRetryOptions() != null) {
+                    // Task-level retry options configured: Use REST API
+                    String chosenName = (userTaskName != null && !userTaskName.isEmpty())
+                        ? userTaskName : "task-" + UUID.randomUUID();
+                    String restUrl = String.format(
+                        "https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s/tasks",
+                        projectId, location, effectiveQueue);
+                    com.google.gson.JsonObject reqObj = new com.google.gson.JsonObject();
+                    reqObj.add("task", buildTaskJsonObject(parent.toString(), projectId, location, effectiveQueue, serviceName, options, chosenName));
 
-                CompletableFuture<TaskHandle> cf = new CompletableFuture<>();
-                ApiFuture<Task> apiFuture = client.createTaskCallable().futureCall(req);
-                ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Task>() {
-                    @Override
-                    public void onSuccess(Task createdTask) {
-                        String chosenTaskName = TaskName.parse(createdTask.getName()).getTask();
-                        TaskOptions handleOptions = new TaskOptions(options);
-                        handleOptions.taskName(chosenTaskName);
-                        TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
-                        handle.etaUsec(finalScheduleTimeMs * 1000L);
-                        cf.complete(handle);
-                    }
+                    CompletableFuture<TaskHandle> cf = new CompletableFuture<>();
+                    CompletableFuture.runAsync(() -> {
+                        try {
+                            String jsonResp = makeRestPost(restUrl, reqObj.toString());
+                            String assignedName = chosenName;
+                            if (jsonResp != null && !jsonResp.isEmpty()) {
+                                com.google.gson.JsonObject respObj = com.google.gson.JsonParser.parseString(jsonResp).getAsJsonObject();
+                                if (respObj.has("name")) {
+                                    String fullName = respObj.get("name").getAsString();
+                                    assignedName = fullName.substring(fullName.lastIndexOf('/') + 1);
+                                }
+                            }
+                            TaskOptions handleOptions = new TaskOptions(options);
+                            handleOptions.taskName(assignedName);
+                            TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
+                            handle.etaUsec(scheduleTimeMs * 1000L);
+                            cf.complete(handle);
+                        } catch (Throwable t) {
+                            cf.completeExceptionally(handleCreateTaskError(t, userTaskName, effectiveQueue));
+                        }
+                    });
+                    taskFutures.add(cf);
+                } else {
+                    // No task-level retry: Use Client SDK
+                    long[] scheduleTimeHolder = new long[1];
+                    CreateTaskRequest req = buildCreateTaskRequest(
+                        parent, projectId, location, effectiveQueue, serviceName, options, scheduleTimeHolder);
 
-                    @Override
-                    public void onFailure(Throwable t) {
-                        cf.completeExceptionally(handleCreateTaskError(t, userTaskName, effectiveQueue));
-                    }
-                }, MoreExecutors.directExecutor());
+                    final long finalScheduleTimeMs = scheduleTimeHolder[0];
 
-                taskFutures.add(cf);
+                    CompletableFuture<TaskHandle> cf = new CompletableFuture<>();
+                    ApiFuture<Task> apiFuture = client.createTaskCallable().futureCall(req);
+                    ApiFutures.addCallback(apiFuture, new ApiFutureCallback<Task>() {
+                        @Override
+                        public void onSuccess(Task createdTask) {
+                            String chosenTaskName = TaskName.parse(createdTask.getName()).getTask();
+                            TaskOptions handleOptions = new TaskOptions(options);
+                            handleOptions.taskName(chosenTaskName);
+                            TaskHandle handle = new TaskHandle(handleOptions, effectiveQueue);
+                            handle.etaUsec(finalScheduleTimeMs * 1000L);
+                            cf.complete(handle);
+                        }
+
+                        @Override
+                        public void onFailure(Throwable t) {
+                            cf.completeExceptionally(handleCreateTaskError(t, userTaskName, effectiveQueue));
+                        }
+                    }, MoreExecutors.directExecutor());
+
+                    taskFutures.add(cf);
+                }
             }
 
             return awaitAllTaskCreationFutures(taskFutures);
@@ -841,11 +878,32 @@ public final class CloudTasksClientWrapper {
             }
         }
         if (options.getRetryOptions() != null) {
-            if (options.getRetryOptions().getTaskRetryLimit() != null) {
-                headersObj.addProperty("X-Task-Retry-Limit", String.valueOf(options.getRetryOptions().getTaskRetryLimit()));
+            RetryOptions ro = options.getRetryOptions();
+            if (ro.getTaskRetryLimit() != null) {
+                headersObj.addProperty("X-Task-Retry-Limit", String.valueOf(ro.getTaskRetryLimit()));
             }
-            if (options.getRetryOptions().getTaskAgeLimitSeconds() != null) {
-                headersObj.addProperty("X-Task-Age-Limit-Seconds", String.valueOf(options.getRetryOptions().getTaskAgeLimitSeconds()));
+            if (ro.getTaskAgeLimitSeconds() != null) {
+                headersObj.addProperty("X-Task-Age-Limit-Seconds", String.valueOf(ro.getTaskAgeLimitSeconds()));
+            }
+
+            com.google.gson.JsonObject retryConfig = new com.google.gson.JsonObject();
+            if (ro.getTaskRetryLimit() != null) {
+                retryConfig.addProperty("maxAttempts", ro.getTaskRetryLimit() + 1);
+            }
+            if (ro.getTaskAgeLimitSeconds() != null) {
+                retryConfig.addProperty("maxRetryDuration", ro.getTaskAgeLimitSeconds() + "s");
+            }
+            if (ro.getMinBackoffSeconds() != null) {
+                retryConfig.addProperty("minBackoff", ro.getMinBackoffSeconds() + "s");
+            }
+            if (ro.getMaxBackoffSeconds() != null) {
+                retryConfig.addProperty("maxBackoff", ro.getMaxBackoffSeconds() + "s");
+            }
+            if (ro.getMaxDoublings() != null) {
+                retryConfig.addProperty("maxDoublings", ro.getMaxDoublings());
+            }
+            if (retryConfig.size() > 0) {
+                taskObj.add("retryConfig", retryConfig);
             }
         }
         httpReq.add("headers", headersObj);
