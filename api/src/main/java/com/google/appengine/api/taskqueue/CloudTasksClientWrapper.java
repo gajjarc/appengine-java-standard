@@ -617,25 +617,90 @@ public final class CloudTasksClientWrapper {
         String projectId = TaskProcessor.getProjectId();
         String location = TaskProcessor.getLocation();
 
-        try {
-            CloudTasksClient client = getClient();
-            GetQueueRequest request = GetQueueRequest.newBuilder()
-                .setName(QueueName.of(projectId, location, effectiveQueue).toString())
-                .setReadMask(FieldMask.newBuilder().addPaths("stats").build())
-                .build();
-
-            Queue queue = client.getQueue(request);
-            QueueStats stats = queue.getStats();
-
-            int tasksCount = (int) stats.getTasksCount();
+        CompletableFuture<QueueStatistics> cf = new CompletableFuture<>();
+        CompletableFuture.runAsync(() -> {
+            int tasksCount = 0;
             long oldestEtaUsec = 0;
-            if (stats.hasOldestEstimatedArrivalTime()) {
-                Timestamp oldest = stats.getOldestEstimatedArrivalTime();
-                oldestEtaUsec = oldest.getSeconds() * 1_000_000L + oldest.getNanos() / 1000L;
+            int executedLastMinute = 0;
+            int requestsInFlight = 0;
+            double enforcedRate = 0.0;
+            boolean fetched = false;
+
+            // Try Client SDK getQueue first with reflectively constructed FieldMask
+            try {
+                CloudTasksClient client = getClient();
+                GetQueueRequest.Builder reqBuilder = GetQueueRequest.newBuilder()
+                    .setName(QueueName.of(projectId, location, effectiveQueue).toString());
+
+                for (java.lang.reflect.Method m : reqBuilder.getClass().getMethods()) {
+                    if (m.getName().equals("setReadMask") && m.getParameterCount() == 1) {
+                        Class<?> paramType = m.getParameterTypes()[0];
+                        if (paramType.getName().endsWith("FieldMask")) {
+                            Object fmBuilder = paramType.getMethod("newBuilder").invoke(null);
+                            fmBuilder.getClass().getMethod("addPaths", String.class).invoke(fmBuilder, "stats");
+                            Object fm = fmBuilder.getClass().getMethod("build").invoke(fmBuilder);
+                            m.invoke(reqBuilder, fm);
+                            break;
+                        }
+                    }
+                }
+
+                Queue queue = client.getQueue(reqBuilder.build());
+                if (queue != null && queue.hasStats()) {
+                    QueueStats stats = queue.getStats();
+                    tasksCount = (int) stats.getTasksCount();
+                    if (stats.hasOldestEstimatedArrivalTime()) {
+                        try {
+                            Object oldest = stats.getOldestEstimatedArrivalTime();
+                            long seconds = (long) oldest.getClass().getMethod("getSeconds").invoke(oldest);
+                            int nanos = (int) oldest.getClass().getMethod("getNanos").invoke(oldest);
+                            oldestEtaUsec = seconds * 1_000_000L + nanos / 1000L;
+                        } catch (Exception ex) {
+                            logger.log(Level.FINE, "Failed to extract oldest arrival time from QueueStats", ex);
+                        }
+                    }
+                    executedLastMinute = (int) stats.getExecutedLastMinuteCount();
+                    requestsInFlight = (int) stats.getConcurrentDispatchesCount();
+                    enforcedRate = stats.getEffectiveExecutionRate();
+                    fetched = true;
+                }
+            } catch (Throwable t) {
+                logger.log(Level.FINE, "Client SDK getQueue failed for stats, falling back to REST: " + t.getMessage(), t);
             }
-            int executedLastMinute = (int) stats.getExecutedLastMinuteCount();
-            int requestsInFlight = (int) stats.getConcurrentDispatchesCount();
-            double enforcedRate = stats.getEffectiveExecutionRate();
+
+            // If not fetched via Client SDK, fallback to REST GET .../queues/{queue}?readMask=stats
+            if (!fetched) {
+                try {
+                    String restUrl = String.format(
+                        "https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s?readMask=stats",
+                        projectId, location, effectiveQueue);
+                    String jsonResp = makeRestGet(restUrl);
+                    com.google.gson.JsonObject queueObj = com.google.gson.JsonParser.parseString(jsonResp).getAsJsonObject();
+                    if (queueObj.has("stats")) {
+                        com.google.gson.JsonObject statsObj = queueObj.getAsJsonObject("stats");
+                        if (statsObj.has("tasksCount")) {
+                            tasksCount = statsObj.get("tasksCount").getAsInt();
+                        }
+                        if (statsObj.has("oldestEstimatedArrivalTime")) {
+                            String isoTime = statsObj.get("oldestEstimatedArrivalTime").getAsString();
+                            java.time.Instant instant = java.time.Instant.parse(isoTime);
+                            oldestEtaUsec = instant.getEpochSecond() * 1_000_000L + instant.getNano() / 1000L;
+                        }
+                        if (statsObj.has("executedLastMinuteCount")) {
+                            executedLastMinute = statsObj.get("executedLastMinuteCount").getAsInt();
+                        }
+                        if (statsObj.has("concurrentDispatchesCount")) {
+                            requestsInFlight = statsObj.get("concurrentDispatchesCount").getAsInt();
+                        }
+                        if (statsObj.has("effectiveExecutionRate")) {
+                            enforcedRate = statsObj.get("effectiveExecutionRate").getAsDouble();
+                        }
+                    }
+                    fetched = true;
+                } catch (Throwable t) {
+                    logger.log(Level.WARNING, "Failed to fetch stats for queue " + effectiveQueue + " via REST API", t);
+                }
+            }
 
             TaskQueueFetchQueueStatsResponse.QueueStats.Builder legacyStatsBuilder =
                 TaskQueueFetchQueueStatsResponse.QueueStats.newBuilder();
@@ -651,11 +716,10 @@ public final class CloudTasksClientWrapper {
             legacyStatsBuilder.setScannerInfo(scannerInfoBuilder);
 
             QueueStatistics queueStats = new QueueStatistics(effectiveQueue, legacyStatsBuilder.build());
-            return CompletableFuture.completedFuture(queueStats);
-        } catch (Exception e) {
-            logger.log(Level.SEVERE, "CLOUDTASK: Failed to fetch stats for queue " + effectiveQueue + " via Client SDK: " + e.getMessage(), e);
-            throw new RuntimeException("CLOUDTASK_STATS_FAILED", e);
-        }
+            cf.complete(queueStats);
+        });
+
+        return cf;
     }
 
     /**
@@ -940,6 +1004,25 @@ public final class CloudTasksClientWrapper {
             java.io.InputStream err = conn.getErrorStream();
             String errText = (err != null) ? new String(err.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8) : "";
             throw new RuntimeException("REST API request to " + urlString + " failed with HTTP " + code + ": " + errText);
+        }
+
+        java.io.InputStream is = conn.getInputStream();
+        return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private static String makeRestGet(String urlString) throws Exception {
+        String token = getValidAccessToken();
+
+        java.net.URL url = new java.net.URL(urlString);
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("GET");
+        conn.setRequestProperty("Authorization", "Bearer " + token);
+
+        int code = conn.getResponseCode();
+        if (code < 200 || code >= 300) {
+            java.io.InputStream err = conn.getErrorStream();
+            String errText = (err != null) ? new String(err.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8) : "";
+            throw new RuntimeException("REST API GET to " + urlString + " failed with HTTP " + code + ": " + errText);
         }
 
         java.io.InputStream is = conn.getInputStream();
