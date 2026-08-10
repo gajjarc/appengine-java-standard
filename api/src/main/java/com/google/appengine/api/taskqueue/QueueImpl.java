@@ -48,6 +48,7 @@ import com.google.protobuf.MessageLite;
 import java.io.UnsupportedEncodingException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -62,10 +63,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import org.jspecify.annotations.Nullable;
 
-/**
- * Implements the {@link Queue} interface. {@link QueueImpl} is thread safe.
- *
- */
+/** Implements the {@link Queue} interface. {@link QueueImpl} is thread safe. */
 class QueueImpl implements Queue {
   private final String queueName;
   // access this member via the getter so that we can override it in tests
@@ -161,10 +159,10 @@ class QueueImpl implements Queue {
     uriCheckNull(uri.getRawFragment(), "fragment");
     String path = uri.getPath();
 
-    if (path == null || path.length() == 0 || path.charAt(0) != '/') {
+    if (path == null || path.isEmpty() || path.charAt(0) != '/') {
       if (path == null) {
         path = "(null)";
-      } else if (path.length() == 0) {
+      } else if (path.isEmpty()) {
         path = "<empty string>";
       }
       throw new IllegalArgumentException(
@@ -517,14 +515,15 @@ class QueueImpl implements Queue {
       if (option.getTaskName() != null && !option.getTaskName().isEmpty()) {
         if (!taskNames.add(option.getTaskName())) {
           throw new IllegalArgumentException(
-              "Identical task names in request : \"%s\" duplicated".formatted(option.getTaskName()));
+              "Identical task names in request : \"%s\" duplicated"
+                  .formatted(option.getTaskName()));
         }
       }
     }
     if (bulkAddRequest.getAddRequestCount() > QueueConstants.maxTasksPerAdd()) {
       throw new IllegalArgumentException(
-          "No more than %d tasks can be added in a single add call".formatted(
-              QueueConstants.maxTasksPerAdd()));
+          "No more than %d tasks can be added in a single add call"
+              .formatted(QueueConstants.maxTasksPerAdd()));
     }
 
     if (hasPullTask && hasPushTask) {
@@ -538,8 +537,10 @@ class QueueImpl implements Queue {
     if (txn != null
         && builtRequest.getSerializedSize() > QueueConstants.maxTransactionalRequestSizeBytes()) {
       throw new IllegalArgumentException(
-          "Transactional add may not be larger than %d bytes: %d bytes requested.".formatted(
-              QueueConstants.maxTransactionalRequestSizeBytes(), builtRequest.getSerializedSize()));
+          "Transactional add may not be larger than %d bytes: %d bytes requested."
+              .formatted(
+                  QueueConstants.maxTransactionalRequestSizeBytes(),
+                  builtRequest.getSerializedSize()));
     }
 
     Future<TaskQueueBulkAddResponse> responseFuture =
@@ -549,8 +550,9 @@ class QueueImpl implements Queue {
       protected List<TaskHandle> wrap(TaskQueueBulkAddResponse bulkAddResponse) {
         if (bulkAddResponse.getTaskResultCount() != bulkAddRequest.getAddRequestCount()) {
           throw new InternalFailureException(
-              "expected %d results from BulkAdd(), got %d".formatted(
-                  bulkAddRequest.getAddRequestCount(), bulkAddResponse.getTaskResultCount()));
+              "expected %d results from BulkAdd(), got %d"
+                  .formatted(
+                      bulkAddRequest.getAddRequestCount(), bulkAddResponse.getTaskResultCount()));
         }
 
         List<TaskHandle> tasks = new ArrayList<>();
@@ -583,7 +585,10 @@ class QueueImpl implements Queue {
             if (taskqueueException == null
                 || taskqueueException instanceof TaskAlreadyExistsException) {
               int result = taskResult.getResult().getNumber();
-              String chosenName = taskResult.hasChosenTaskName() ? taskResult.getChosenTaskName().toStringUtf8() : options.getTaskName();
+              String chosenName =
+                  taskResult.hasChosenTaskName()
+                      ? taskResult.getChosenTaskName().toStringUtf8()
+                      : options.getTaskName();
               String detail =
                   (result == TaskQueueServiceError.ErrorCode.UNKNOWN_QUEUE_VALUE)
                       ? queueName
@@ -659,14 +664,7 @@ class QueueImpl implements Queue {
   // (e.g. multipart/form-data) that can support more space efficient
   // binary formatted payloads.
   byte[] encodeParamsPost(List<Param> params) {
-    byte[] payload;
-    try {
-      payload = encodeParamsUrlEncoded(params).getBytes("UTF-8");
-    } catch (UnsupportedEncodingException exception) {
-      throw new UnsupportedTranslationException(exception);
-    }
-
-    return payload;
+    return encodeParamsUrlEncoded(params).getBytes(StandardCharsets.UTF_8);
   }
 
   // Returns content in the x-www-form-urlencoded format for parameters.
@@ -803,14 +801,14 @@ class QueueImpl implements Queue {
     long leaseMillis = options.getUnit().toMillis(options.getLease());
     if (leaseMillis > QueueConstants.maxLease(MILLISECONDS)) {
       throw new IllegalArgumentException(
-          "A lease period can be no longer than %d seconds".formatted(
-              QueueConstants.maxLease(SECONDS)));
+          "A lease period can be no longer than %d seconds"
+              .formatted(QueueConstants.maxLease(SECONDS)));
     }
 
     if (options.getCountLimit() > QueueConstants.maxLeaseCount()) {
       throw new IllegalArgumentException(
-          "No more than %d tasks can be leased in one call".formatted(
-              QueueConstants.maxLeaseCount()));
+          "No more than %d tasks can be leased in one call"
+              .formatted(QueueConstants.maxLeaseCount()));
     }
 
     TaskQueueQueryAndOwnTasksRequest.Builder leaseRequest =
@@ -938,13 +936,12 @@ class QueueImpl implements Queue {
     if (leaseMillis > QueueConstants.maxLease(MILLISECONDS)) {
       throw new IllegalArgumentException(
           "The lease time specified (%s seconds) is too large. Lease period can be no longer than %d seconds."
-              .formatted(
-                  formatLeaseTimeInSeconds(leaseMillis), QueueConstants.maxLease(SECONDS)));
+              .formatted(formatLeaseTimeInSeconds(leaseMillis), QueueConstants.maxLease(SECONDS)));
     }
     if (leaseMillis < 0) {
       throw new IllegalArgumentException(
-          "The lease time must not be negative. Specified lease time was %s seconds.".formatted(
-              formatLeaseTimeInSeconds(leaseMillis)));
+          "The lease time must not be negative. Specified lease time was %s seconds."
+              .formatted(formatLeaseTimeInSeconds(leaseMillis)));
     }
 
     TaskQueueModifyTaskLeaseRequest.Builder request = TaskQueueModifyTaskLeaseRequest.newBuilder();
@@ -963,8 +960,8 @@ class QueueImpl implements Queue {
   }
 
   private String formatLeaseTimeInSeconds(long milliSeconds) {
-    long seconds = TimeUnit.SECONDS.convert(milliSeconds, TimeUnit.MILLISECONDS);
-    long remainder = milliSeconds - TimeUnit.MILLISECONDS.convert(seconds, TimeUnit.SECONDS);
+    long seconds = TimeUnit.SECONDS.convert(Duration.ofMillis(milliSeconds));
+    long remainder = milliSeconds - TimeUnit.MILLISECONDS.convert(Duration.ofSeconds(seconds));
     String formatString = milliSeconds < 0 ? "-%01d.%03d" : "%01d.%03d";
     return formatString.formatted(Math.abs(seconds), Math.abs(remainder));
   }
@@ -989,7 +986,7 @@ class QueueImpl implements Queue {
       throw new IllegalArgumentException("Deadline must be > 0, got " + deadlineInSeconds);
     }
 
-    List<Queue> queues = Collections.<Queue>singletonList(this);
+    List<Queue> queues = Collections.singletonList(this);
     Future<List<QueueStatistics>> future =
         QueueStatistics.fetchForQueuesAsync(queues, apiHelper, deadlineInSeconds);
     return extractSingleEntry(future);

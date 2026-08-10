@@ -41,23 +41,20 @@
     <dependency>
       <groupId>com.google.cloud</groupId>
       <artifactId>google-cloud-tasks</artifactId>
-      <version>2.95.0</version>
-      <scope>system</scope>
-      <systemPath>${project.basedir}/../api/lib/google-cloud-tasks-2.95.0.jar</systemPath>
+      <version>2.34.0</version>
+      <optional>true</optional>
     </dependency>
     <dependency>
       <groupId>com.google.api.grpc</groupId>
       <artifactId>proto-google-cloud-tasks-v2beta3</artifactId>
-      <version>2.95.0</version>
-      <scope>system</scope>
-      <systemPath>${project.basedir}/../api/lib/proto-google-cloud-tasks-v2beta3-2.95.0.jar</systemPath>
+      <version>0.125.0</version>
+      <optional>true</optional>
     </dependency>
     <dependency>
       <groupId>com.google.api</groupId>
       <artifactId>gax</artifactId>
-      <version>2.78.0</version>
-      <scope>system</scope>
-      <systemPath>${project.basedir}/../api/lib/gax-2.78.0.jar</systemPath>
+      <version>2.42.0</version>
+      <optional>true</optional>
     </dependency>
     <dependency>
       <groupId>joda-time</groupId>
@@ -479,9 +476,6 @@
                   <include>com.google.appengine:geronimo-javamail_1.4_spec:*</include>
                   <include>com.google.appengine:protos:*</include>
                   <include>com.google.appengine:runtime-shared:*</include>
-                  <include>com.google.cloud:google-cloud-tasks:*</include>
-                  <include>com.google.api.grpc:proto-google-cloud-tasks-v2beta3:*</include>
-                  <include>com.google.api:gax:*</include>
                   <include>com.google.cloud.datastore:datastore-v1-proto-client:*</include>
                   <include>com.google.code.findbugs:jsr305:*</include>
                   <include>com.google.code.gson:gson:*</include>

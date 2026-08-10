@@ -21,6 +21,7 @@ import java.io.ObjectInputStream;
 import java.io.Serializable;
 import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -30,12 +31,11 @@ import org.jspecify.annotations.Nullable;
  * Created from {@link Queue#add(TaskOptions)}. Contains the task name (generated if otherwise
  * unspecified), task ETA (computed if not specified) and queue name. The queue name and task name
  * uniquely identify the task for an application.
- *
  */
 public final class TaskHandle implements Serializable {
   private static final long serialVersionUID = -2578988193753847512L;
   private String taskName;
-  private String queueName;
+  private final String queueName;
   // etaUsec is used to track the eta to the same precision that is associated
   // with the task in bigtable. Currently this is required when modifying the
   // task lease as there is a current owner check  that compares the
@@ -45,7 +45,7 @@ public final class TaskHandle implements Serializable {
   // retrieved from the queue - and these tasks are represented by TaskHandles.
   private long etaUsec;
   private long etaMillis;
-  private Integer retryCount;
+  private final Integer retryCount;
   private @Nullable TaskOptions options;
 
   TaskHandle(TaskOptions options, String queueName, @Nullable Integer retryCount) {
@@ -63,7 +63,9 @@ public final class TaskHandle implements Serializable {
     this(options, queueName, 0);
   }
 
-  /** @deprecated Use {@link TaskHandle#TaskHandle(TaskOptions, String)} */
+  /**
+   * @deprecated Use {@link TaskHandle#TaskHandle(TaskOptions, String)}
+   */
   @Deprecated
   public TaskHandle(String name, String queueName, long etaMillis) {
     this(TaskOptions.Builder.withTaskName(name).etaMillis(etaMillis), queueName, null);
@@ -137,7 +139,7 @@ public final class TaskHandle implements Serializable {
   static void validateTaskName(String taskName) {
     // Verify task name matches RE specification.
     if (taskName == null
-        || taskName.length() == 0
+        || taskName.isEmpty()
         || !QueueConstants.TASK_NAME_PATTERN.matcher(taskName).matches()) {
       throw new IllegalArgumentException(
           "Task name does not match expression "
@@ -208,7 +210,7 @@ public final class TaskHandle implements Serializable {
   }
 
   /** Returns the HTTP/Queue method of this task options. Can return {@code null}. */
-  public TaskOptions.Method getMethod() {
+  public TaskOptions.@Nullable Method getMethod() {
     return options != null ? options.getMethod() : null;
   }
 
@@ -291,12 +293,11 @@ public final class TaskHandle implements Serializable {
    * @throws UnsupportedOperationException if the {@code options} has no payload or the payload
    *     bytes could not be interpreted as application/x-www-form-urlencoded key-value pairs.
    */
-  public List<Map.Entry<String, String>> extractParams()
-      throws UnsupportedEncodingException, UnsupportedOperationException {
-    String payload = new String(getPayload());
+  public List<Map.Entry<String, String>> extractParams() {
+    String payload = new String(getPayload(), StandardCharsets.UTF_8);
     String[] paramStrings = payload.split("&");
 
-    List<Map.Entry<String, String>> result = new ArrayList<Map.Entry<String, String>>();
+    List<Map.Entry<String, String>> result = new ArrayList<>();
     for (String param : paramStrings) {
       String[] kv = param.split("=", 2);
       if (kv.length != 2) {
@@ -309,7 +310,9 @@ public final class TaskHandle implements Serializable {
                 + kv.length);
       }
       result.add(
-          new KeyValuePair(URLDecoder.decode(kv[0], "UTF-8"), URLDecoder.decode(kv[1], "UTF-8")));
+          new KeyValuePair(
+              URLDecoder.decode(kv[0], StandardCharsets.UTF_8),
+              URLDecoder.decode(kv[1], StandardCharsets.UTF_8)));
     }
     return result;
   }
